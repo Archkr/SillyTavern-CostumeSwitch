@@ -33,11 +33,19 @@ export function mergeDetectionsForReport(report = {}) {
     };
 
     if (Array.isArray(report.matches)) {
-        report.matches.forEach(match => add(match));
+        report.matches.forEach(match => {
+            if ((match?.matchKind || "").toLowerCase() === "pronoun") {
+                return;
+            }
+            add(match);
+        });
     }
 
     if (Array.isArray(report.scoreDetails)) {
         report.scoreDetails.forEach(detail => {
+            if ((detail?.matchKind || "").toLowerCase() === "pronoun") {
+                return;
+            }
             add({
                 name: detail.name,
                 matchKind: detail.matchKind,

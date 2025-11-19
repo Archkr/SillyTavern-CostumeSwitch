@@ -1,5 +1,5 @@
-import { extension_settings, getContext } from "../../../extensions.js";
-import { saveSettingsDebounced, event_types, eventSource } from "../../../../script.js";
+import { extension_settings, getContext, renderExtensionTemplateAsync } from "../../../extensions.js";
+import { saveSettingsDebounced, saveChatDebounced, event_types, eventSource, system_message_types } from "../../../../script.js";
 import { executeSlashCommandsOnChatInput, registerSlashCommand } from "../../../slash-commands.js";
 import {
     DEFAULT_ACTION_VERBS_PRESENT,
@@ -28,11 +28,23 @@ import {
     compileProfileRegexes,
     collectDetections,
 } from "./src/detector-core.js";
+import { collectProfilePreprocessorScripts, applyPreprocessorScripts } from "./src/core/script-preprocessor.js";
+import { createNamePreprocessor, resolveFuzzyTolerance } from "./src/core/name-preprocessor.js";
 import {
     mergeDetectionsForReport,
     summarizeDetections,
     summarizeSkipReasonsForReport,
 } from "./src/report-utils.js";
+import {
+    applySceneRosterUpdate,
+    resetSceneState,
+    replaceLiveTesterOutputs,
+    clearLiveTesterOutputs,
+    getCurrentSceneSnapshot,
+    getLiveTesterOutputsSnapshot,
+    deriveSceneRosterState,
+} from "./src/core/state.js";
+import { registerSillyTavernIntegration, unregisterSillyTavernIntegration } from "./src/systems/integration/sillytavern.js";
 import {
     loadProfiles,
     normalizeProfile,
@@ -42,13 +54,45 @@ import {
     normalizePatternSlot,
     preparePatternSlotsForSave,
     flattenPatternSlots,
+    reconcilePatternSlotReferences,
+    normalizeScriptCollections,
 } from "./profile-utils.js";
+import {
+    setScenePanelContainer,
+    setScenePanelContent,
+    setSceneCollapseToggle,
+    setSceneSectionsContainer,
+    setSceneToolbar,
+    setSceneRosterList,
+    setSceneActiveCards,
+    setSceneLiveLog,
+    setSceneFooterButton,
+    setSceneRosterSection,
+    setSceneActiveSection,
+    setSceneLiveLogSection,
+    setSceneStatusText,
+    setSceneCoverageSection,
+    setSceneCoveragePronouns,
+    setSceneCoverageAttribution,
+    setSceneCoverageAction,
+    getScenePanelContainer,
+    getSceneCollapseToggle,
+    getSceneSectionsContainer,
+    getSceneRosterList,
+    getSceneActiveCards,
+    getSceneLiveLog,
+} from "./src/ui/scenePanelState.js";
+import { renderScenePanel, createScenePanelRefreshHandler } from "./src/ui/render/panel.js";
+import { formatRelativeTime } from "./src/ui/render/utils.js";
 
 const extensionName = "SillyTavern-CostumeSwitch";
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
+const extensionTemplateNamespace = `third-party/${extensionName}`;
+const extensionFolderPath = `scripts/extensions/${extensionTemplateNamespace}`;
 const logPrefix = "[CostumeSwitch]";
+const INCREMENTAL_SCAN_PADDING = 8;
 const NO_EFFECTIVE_PATTERNS_MESSAGE = "All detection patterns were filtered out by ignored names. No detectors can run until you restore at least one allowed pattern.";
 const FOCUS_LOCK_NOTICE_INTERVAL = 2500;
+const MESSAGE_OUTCOME_STORAGE_KEY = "cs_scene_outcomes";
 
 function createFocusLockNotice() {
     return { at: 0, character: null, displayName: null, message: null, event: null };
@@ -173,6 +217,8 @@ const AUTO_SAVE_RECOMPILE_KEYS = new Set([
     'attributionVerbs',
     'actionVerbs',
     'pronounVocabulary',
+    'scriptCollections',
+    'scanLowercaseFallbackTokens',
 ]);
 const AUTO_SAVE_FOCUS_LOCK_KEYS = new Set(['patterns']);
 const AUTO_SAVE_REASON_OVERRIDES = {
@@ -194,6 +240,12 @@ const AUTO_SAVE_REASON_OVERRIDES = {
     detectPossessive: 'possessive detection',
     detectPronoun: 'pronoun detection',
     detectGeneral: 'general name detection',
+    scanLowercaseFallbackTokens: 'lowercase fallback scanning',
+    fuzzyTolerance: 'name matching tolerance',
+    fuzzyFallbackMaxScore: 'fuzzy fallback score cap',
+    fuzzyFallbackCooldown: 'fuzzy fallback cooldown',
+    translateFuzzyNames: 'accent translation',
+    scriptCollections: 'regex preprocessor',
     enableOutfits: 'outfit automation',
     attributionVerbs: 'attribution verbs',
     actionVerbs: 'action verbs',
@@ -302,6 +354,7 @@ const PROFILE_DEFAULTS = {
     patterns: [],
     ignorePatterns: [],
     vetoPatterns: ["OOC:", "(OOC)"],
+    scriptCollections: [],
     defaultCostume: "",
     debug: false,
     globalCooldownMs: 1200,
@@ -319,12 +372,18 @@ const PROFILE_DEFAULTS = {
     detectPronoun: true,
     detectGeneral: false,
     scanDialogueActions: false,
+    scanLowercaseFallbackTokens: false,
     pronounVocabulary: [...DEFAULT_PRONOUNS],
     attributionVerbs: [...DEFAULT_ATTRIBUTION_VERB_FORMS],
     actionVerbs: [...DEFAULT_ACTION_VERB_FORMS],
     detectionBias: 0,
     enableSceneRoster: true,
     sceneRosterTTL: 5,
+    fuzzyTolerance: "off",
+    fuzzyFallbackMaxScore: null,
+    fuzzyFallbackCooldown: null,
+    translateFuzzyNames: false,
+    translateNames: false,
     prioritySpeakerWeight: 5,
     priorityAttributionWeight: 4,
     priorityActionWeight: 3,
@@ -357,6 +416,36 @@ function getVerbInflections(category = "attribution", edition = "default") {
     return buildVerbSlices({ category, edition });
 }
 
+const DEFAULT_SCENE_PANEL_SECTIONS = Object.freeze({
+    roster: true,
+    activeCharacters: true,
+    liveLog: true,
+    coverage: true,
+});
+
+const DEFAULT_SCENE_PANEL_SETTINGS = Object.freeze({
+    enabled: true,
+    autoOpenOnStream: true,
+    autoOpenOnResults: true,
+    showRosterAvatars: true,
+    autoPinActive: true,
+    sections: DEFAULT_SCENE_PANEL_SECTIONS,
+});
+
+const SCRIPT_COLLECTION_KEYS = Object.freeze(["global", "preset", "scoped"]);
+const SCRIPT_COLLECTION_LABELS = Object.freeze({
+    global: "Global",
+    preset: "Preset",
+    scoped: "Scoped",
+});
+
+const SCENE_PANEL_SECTION_LABELS = Object.freeze({
+    roster: "Scene roster",
+    activeCharacters: "Active characters",
+    liveLog: "Live log",
+    coverage: "Coverage suggestions",
+});
+
 const DEFAULTS = {
     enabled: true,
     profiles: {
@@ -366,7 +455,58 @@ const DEFAULTS = {
     scorePresets: structuredClone(DEFAULT_SCORE_PRESETS),
     activeScorePreset: 'Balanced Baseline',
     focusLock: { character: null },
+    scenePanel: {
+        ...DEFAULT_SCENE_PANEL_SETTINGS,
+        sections: { ...DEFAULT_SCENE_PANEL_SECTIONS },
+    },
 };
+
+function ensureScenePanelSettings(settings) {
+    const defaults = DEFAULTS.scenePanel;
+    if (!settings || typeof settings !== "object") {
+        return {
+            ...defaults,
+            sections: { ...DEFAULT_SCENE_PANEL_SECTIONS },
+        };
+    }
+    const incoming = settings.scenePanel;
+    let normalized;
+    if (typeof incoming !== "object" || incoming === null) {
+        normalized = {
+            ...defaults,
+            sections: { ...DEFAULT_SCENE_PANEL_SECTIONS },
+        };
+    } else {
+        const sections = typeof incoming.sections === "object" && incoming.sections !== null
+            ? incoming.sections
+            : {};
+        normalized = {
+            ...defaults,
+            ...incoming,
+            sections: {
+                ...DEFAULT_SCENE_PANEL_SECTIONS,
+                ...sections,
+            },
+        };
+    }
+
+    normalized.enabled = normalized.enabled !== false;
+    normalized.autoOpenOnStream = normalized.autoOpenOnStream !== false;
+    normalized.autoOpenOnResults = normalized.autoOpenOnResults !== false;
+    normalized.showRosterAvatars = normalized.showRosterAvatars !== false;
+    normalized.autoPinActive = normalized.autoPinActive !== false;
+    normalized.sections.roster = normalized.sections.roster !== false;
+    normalized.sections.activeCharacters = normalized.sections.activeCharacters !== false;
+    normalized.sections.liveLog = normalized.sections.liveLog !== false;
+    normalized.sections.coverage = normalized.sections.coverage !== false;
+
+    settings.scenePanel = {
+        ...normalized,
+        sections: { ...normalized.sections },
+    };
+
+    return settings.scenePanel;
+}
 
 // ======================================================================
 // GLOBAL STATE
@@ -383,15 +523,22 @@ const state = {
     perMessageBuffers: new Map(),
     perMessageStates: new Map(),
     messageStats: new Map(), // For statistical logging
+    messageMatches: new Map(),
     eventHandlers: {},
+    integrationHandlers: null,
     compiledRegexes: {},
     statusTimer: null,
     testerTimers: [],
     lastTesterReport: null,
+    lastPreprocessedText: "",
+    lastPreprocessorScripts: [],
+    lastFuzzyResolution: null,
+    lastDetectionCount: 0,
     recentDecisionEvents: [],
     lastVetoMatch: null,
     buildMeta: null,
     topSceneRanking: new Map(),
+    topSceneRankingUpdatedAt: new Map(),
     latestTopRanking: { bufKey: null, ranking: [], fullRanking: [], updatedAt: 0 },
     currentGenerationKey: null,
     mappingLookup: new Map(),
@@ -411,6 +558,8 @@ const state = {
     draftPatternIds: new Set(),
     focusLockNotice: createFocusLockNotice(),
     patternSearchQuery: "",
+    lastSceneSwipeId: null,
+    lastSceneDigest: null,
 };
 
 let nextOutfitCardId = 1;
@@ -696,8 +845,12 @@ function pruneMessageCaches(limit = MAX_TRACKED_MESSAGES) {
         state.perMessageBuffers?.delete(oldest);
         state.perMessageStates?.delete(oldest);
         state.messageStats?.delete(oldest);
+        state.messageMatches?.delete(oldest);
         if (state.topSceneRanking instanceof Map) {
             state.topSceneRanking.delete(oldest);
+        }
+        if (state.topSceneRankingUpdatedAt instanceof Map) {
+            state.topSceneRankingUpdatedAt.delete(oldest);
         }
     }
 }
@@ -723,9 +876,26 @@ function getPriorityWeights(profile) {
     return weights;
 }
 
-function findAllMatches(combined) {
+const PRONOUN_SUPPRESS_REASONS = new Set([
+    "already-active",
+    "outfit-unchanged",
+    "per-trigger-cooldown",
+    "failed-trigger-cooldown",
+]);
+
+function shouldLogMatchEvent(matchKind, reason) {
+    if (matchKind !== "pronoun") {
+        return true;
+    }
+    const normalizedReason = String(reason ?? "").toLowerCase();
+    return !PRONOUN_SUPPRESS_REASONS.has(normalizedReason);
+}
+
+function findAllMatches(combined, options = {}) {
     const profile = getActiveProfile();
     const { compiledRegexes } = state;
+    state.lastDetectionCount = 0;
+    state.lastFuzzyResolution = null;
     if (!profile || !combined) {
         return [];
     }
@@ -742,17 +912,55 @@ function findAllMatches(combined) {
         }
     }
 
-    return collectDetections(combined, profile, compiledRegexes, {
+    const detectionOptions = {
         priorityWeights: getPriorityWeights(profile),
         lastSubject,
         scanDialogueActions: Boolean(profile.scanDialogueActions),
-    });
+        fuzzyTolerance: profile.fuzzyTolerance,
+        translateFuzzyNames: profile.translateFuzzyNames ?? profile.translateNames ?? PROFILE_DEFAULTS.translateFuzzyNames,
+    };
+
+    if (Number.isFinite(options?.startIndex) && options.startIndex >= 0) {
+        detectionOptions.startIndex = Math.floor(options.startIndex);
+    }
+
+    if (Number.isFinite(options?.minIndex) && options.minIndex >= 0) {
+        detectionOptions.minIndex = Math.floor(options.minIndex);
+    }
+
+    if (Number.isFinite(options?.bufferOffset) && options.bufferOffset >= 0) {
+        detectionOptions.bufferOffset = Math.floor(options.bufferOffset);
+    }
+
+    if (typeof options?.quoteState === "object" && options.quoteState) {
+        detectionOptions.quoteState = options.quoteState;
+    }
+
+    if (Number.isFinite(options?.lastIndex)) {
+        detectionOptions.lastIndex = Math.floor(options.lastIndex);
+    }
+
+    const matches = collectDetections(combined, profile, compiledRegexes, detectionOptions);
+    const processed = typeof matches?.preprocessedText === "string"
+        ? matches.preprocessedText
+        : combined;
+    state.lastPreprocessedText = processed;
+    state.lastPreprocessorScripts = clonePreprocessorScripts(matches?.preprocessorScripts || []);
+    state.lastFuzzyResolution = cloneFuzzyResolution(matches?.fuzzyResolution);
+    state.lastDetectionCount = Array.isArray(matches) ? matches.length : 0;
+    return matches;
 }
 
 function findBestMatch(combined, precomputedMatches = null, options = {}) {
     const profile = getActiveProfile();
     if (!profile) return null;
-    const allMatches = Array.isArray(precomputedMatches) ? precomputedMatches : findAllMatches(combined);
+    const matchOptions = options && typeof options === 'object' ? { ...options } : {};
+    const allMatches = Array.isArray(precomputedMatches)
+        ? precomputedMatches
+        : findAllMatches(combined, matchOptions);
+    if (Array.isArray(precomputedMatches) && typeof precomputedMatches.preprocessedText === "string") {
+        state.lastPreprocessedText = precomputedMatches.preprocessedText;
+    }
     if (allMatches.length === 0) return null;
 
     let rosterSet = null;
@@ -775,6 +983,14 @@ function findBestMatch(combined, precomputedMatches = null, options = {}) {
         scoringOptions.minIndex = options.minIndex;
     }
 
+    if (Number.isFinite(allMatches?.tokenCount)) {
+        scoringOptions.tokenLength = allMatches.tokenCount;
+    }
+
+    if (Number.isFinite(allMatches?.minTokenIndex)) {
+        scoringOptions.minTokenIndex = allMatches.minTokenIndex;
+    }
+
     return getWinner(allMatches, profile.detectionBias, combined.length, scoringOptions);
 }
 
@@ -791,17 +1007,46 @@ function getWinner(matches, bias = 0, textLength = 0, options = {}) {
         ? options.priorityMultiplier
         : 100;
     const minIndex = Number.isFinite(options?.minIndex) && options.minIndex >= 0 ? options.minIndex : null;
+    const fallbackTokenLength = Number.isFinite(matches?.tokenCount) ? matches.tokenCount : null;
+    const tokenLength = Number.isFinite(options?.tokenLength) ? options.tokenLength : fallbackTokenLength;
+    const minTokenIndex = Number.isFinite(options?.minTokenIndex)
+        ? options.minTokenIndex
+        : Number.isFinite(matches?.minTokenIndex)
+            ? matches.minTokenIndex
+            : null;
+    const useTokenDistance = Number.isFinite(tokenLength) && tokenLength >= 0;
     const scoredMatches = [];
 
     matches.forEach((match) => {
         const isActive = match.priority >= 3; // speaker, attribution, action
         const hasFiniteIndex = Number.isFinite(match.matchIndex);
-        if (minIndex != null && hasFiniteIndex && match.matchIndex <= minIndex) {
+        const matchLength = Number.isFinite(match.matchLength) && match.matchLength > 0
+            ? Math.floor(match.matchLength)
+            : 1;
+        const matchEndIndex = hasFiniteIndex
+            ? match.matchIndex + matchLength - 1
+            : null;
+        const matchTokenIndex = Number.isFinite(match.tokenIndex)
+            ? Math.floor(match.tokenIndex)
+            : null;
+        const matchTokenLength = Number.isFinite(match.tokenLength) && match.tokenLength > 0
+            ? Math.floor(match.tokenLength)
+            : null;
+        const tokenEndIndex = matchTokenIndex != null
+            ? matchTokenIndex + (matchTokenLength != null ? matchTokenLength - 1 : 0)
+            : null;
+        if (minIndex != null
+            && hasFiniteIndex
+            && matchEndIndex != null
+            && matchEndIndex <= minIndex) {
             return;
         }
-        const distanceFromEnd = Number.isFinite(textLength)
-            ? Math.max(0, textLength - match.matchIndex)
-            : 0;
+        let distanceFromEnd = 0;
+        if (useTokenDistance && matchTokenIndex != null) {
+            distanceFromEnd = Math.max(0, tokenLength - matchTokenIndex);
+        } else if (Number.isFinite(textLength) && hasFiniteIndex) {
+            distanceFromEnd = Math.max(0, textLength - match.matchIndex);
+        }
         const baseScore = match.priority * priorityMultiplier - distancePenaltyWeight * distanceFromEnd;
         let score = baseScore + (isActive ? bias : 0);
         if (rosterSet) {
@@ -815,7 +1060,12 @@ function getWinner(matches, bias = 0, textLength = 0, options = {}) {
                 score += bonus;
             }
         }
-        scoredMatches.push({ ...match, score });
+        scoredMatches.push({
+            ...match,
+            score,
+            tokenIndex: matchTokenIndex,
+            tokenLength: matchTokenLength,
+        });
     });
     scoredMatches.sort((a, b) => b.score - a.score);
     return scoredMatches[0];
@@ -840,24 +1090,32 @@ function rankSceneCharacters(matches, options = {}) {
     }
 
     const rosterSet = buildLowercaseSet(options?.rosterSet);
+    const fallbackTokenLength = Number.isFinite(matches?.tokenCount) ? matches.tokenCount : null;
+    const tokenLength = Number.isFinite(options?.tokenLength) ? options.tokenLength : fallbackTokenLength;
+    const useTokenMetrics = Number.isFinite(tokenLength) && tokenLength >= 0;
     const summary = new Map();
 
     matches.forEach((match, idx) => {
         if (!match || !match.name) return;
-        const normalized = normalizeCostumeName(match.name);
+        const canonical = typeof match.name === "string" ? match.name.trim() : "";
+        const normalized = normalizeCostumeName(canonical);
         if (!normalized) return;
 
-        const displayName = String(match.name).trim() || normalized;
+        const rawName = typeof match.rawName === "string" ? match.rawName.trim() : "";
+        const displayName = canonical || normalized;
         const key = normalized.toLowerCase();
         let entry = summary.get(key);
         if (!entry) {
             entry = {
                 name: displayName,
+                rawName: rawName || displayName,
                 normalized,
                 count: 0,
                 bestPriority: -Infinity,
                 earliest: Number.POSITIVE_INFINITY,
                 latest: Number.NEGATIVE_INFINITY,
+                earliestToken: Number.POSITIVE_INFINITY,
+                latestToken: Number.NEGATIVE_INFINITY,
                 inSceneRoster: rosterSet ? rosterSet.has(key) : false,
             };
             summary.set(key, entry);
@@ -869,12 +1127,21 @@ function rankSceneCharacters(matches, options = {}) {
             entry.bestPriority = priority;
         }
         const index = Number.isFinite(match.matchIndex) ? match.matchIndex : idx;
+        const tokenIndex = Number.isFinite(match.tokenIndex) ? Math.floor(match.tokenIndex) : null;
         if (index < entry.earliest) {
             entry.earliest = index;
             entry.firstMatchKind = match.matchKind || entry.firstMatchKind || null;
         }
         if (index > entry.latest) {
             entry.latest = index;
+        }
+        if (tokenIndex != null) {
+            if (tokenIndex < entry.earliestToken) {
+                entry.earliestToken = tokenIndex;
+            }
+            if (tokenIndex > entry.latestToken) {
+                entry.latestToken = tokenIndex;
+            }
         }
         if (!entry.inSceneRoster && rosterSet) {
             entry.inSceneRoster = rosterSet.has(key);
@@ -894,8 +1161,12 @@ function rankSceneCharacters(matches, options = {}) {
     const ranked = Array.from(summary.values()).map((entry) => {
         const priorityScore = Number.isFinite(entry.bestPriority) ? entry.bestPriority : 0;
         const earliest = Number.isFinite(entry.earliest) ? entry.earliest : Number.MAX_SAFE_INTEGER;
+        const earliestToken = Number.isFinite(entry.earliestToken) ? entry.earliestToken : Number.POSITIVE_INFINITY;
+        const distanceBasis = useTokenMetrics && Number.isFinite(earliestToken)
+            ? earliestToken
+            : earliest;
         const rosterBonus = entry.inSceneRoster ? rosterBonusWeight : 0;
-        const earliestPenalty = earliest * distancePenaltyWeight;
+        const earliestPenalty = distanceBasis * distancePenaltyWeight;
         const score = entry.count * countWeight + priorityScore * priorityMultiplier + rosterBonus - earliestPenalty;
         return {
             name: entry.name,
@@ -904,8 +1175,11 @@ function rankSceneCharacters(matches, options = {}) {
             bestPriority: priorityScore,
             earliest: Number.isFinite(entry.earliest) ? entry.earliest : null,
             latest: Number.isFinite(entry.latest) ? entry.latest : null,
+            earliestToken: Number.isFinite(entry.earliestToken) ? entry.earliestToken : null,
+            latestToken: Number.isFinite(entry.latestToken) ? entry.latestToken : null,
             inSceneRoster: Boolean(entry.inSceneRoster),
             firstMatchKind: entry.firstMatchKind || null,
+            rawName: entry.rawName,
             score,
         };
     });
@@ -935,11 +1209,19 @@ function scoreMatchesDetailed(matches, textLength, options = {}) {
     const rosterPriorityDropoff = resolveNumericSetting(options?.rosterPriorityDropoff, PROFILE_DEFAULTS.rosterPriorityDropoff);
     const distancePenaltyWeight = resolveNumericSetting(options?.distancePenaltyWeight, PROFILE_DEFAULTS.distancePenaltyWeight);
     const rosterSet = buildLowercaseSet(options?.rosterSet);
+    const fallbackTokenLength = Number.isFinite(matches?.tokenCount) ? matches.tokenCount : null;
+    const tokenLength = Number.isFinite(options?.tokenLength) ? options.tokenLength : fallbackTokenLength;
+    const useTokenDistance = Number.isFinite(tokenLength) && tokenLength >= 0;
 
     const scored = matches.map((match, idx) => {
         const priority = Number(match?.priority) || 0;
         const matchIndex = Number.isFinite(match?.matchIndex) ? match.matchIndex : idx;
-        const distanceFromEnd = Number.isFinite(textLength) ? Math.max(0, textLength - matchIndex) : 0;
+        const matchTokenIndex = Number.isFinite(match?.tokenIndex) ? Math.floor(match.tokenIndex) : null;
+        const distanceFromEnd = useTokenDistance && matchTokenIndex != null
+            ? Math.max(0, tokenLength - matchTokenIndex)
+            : Number.isFinite(textLength)
+                ? Math.max(0, textLength - matchIndex)
+                : 0;
         const priorityScore = priority * priorityMultiplier;
         const biasBonus = priority >= 3 ? detectionBias : 0;
         let rosterBonusApplied = 0;
@@ -960,6 +1242,7 @@ function scoreMatchesDetailed(matches, textLength, options = {}) {
         const totalScore = priorityScore + biasBonus + rosterBonusApplied - distancePenalty;
         return {
             name: match?.name || '(unknown)',
+            rawName: match?.rawName || match?.name || '(unknown)',
             matchKind: match?.matchKind || 'unknown',
             priority,
             priorityScore,
@@ -969,7 +1252,10 @@ function scoreMatchesDetailed(matches, textLength, options = {}) {
             totalScore,
             matchIndex,
             charIndex: matchIndex,
+            tokenIndex: matchTokenIndex,
+            tokenDistance: useTokenDistance && matchTokenIndex != null ? distanceFromEnd : null,
             inRoster,
+            nameResolution: match?.nameResolution || null,
         };
     });
 
@@ -991,7 +1277,7 @@ function ensureSessionData() {
     return settings.session;
 }
 
-function updateSessionTopCharacters(bufKey, ranking) {
+function updateSessionTopCharacters(bufKey, ranking, timestamp = Date.now()) {
     const session = ensureSessionData();
     if (!session) return;
 
@@ -1012,13 +1298,13 @@ function updateSessionTopCharacters(bufKey, ranking) {
     session.topCharactersString = names.join(', ');
     session.topCharacterDetails = details;
     session.lastMessageKey = bufKey || null;
-    session.lastUpdated = Date.now();
+    session.lastUpdated = timestamp;
 
     state.latestTopRanking = {
         bufKey: bufKey || null,
         ranking: topRanking,
         fullRanking: Array.isArray(ranking) ? ranking : [],
-        updatedAt: session.lastUpdated,
+        updatedAt: timestamp,
     };
 }
 
@@ -1031,6 +1317,12 @@ function clearSessionTopCharacters() {
     session.topCharacterDetails = [];
     session.lastMessageKey = null;
     session.lastUpdated = Date.now();
+
+    if (state.topSceneRankingUpdatedAt instanceof Map) {
+        state.topSceneRankingUpdatedAt.clear();
+    } else {
+        state.topSceneRankingUpdatedAt = new Map();
+    }
 
     state.latestTopRanking = {
         bufKey: null,
@@ -1075,10 +1367,1585 @@ function getLastTopCharacters(count = 4) {
     return [];
 }
 
+// ======================================================================
+// SCENE PANEL RENDERING
+// ======================================================================
+const SCENE_PANEL_RENDER_DEBOUNCE_MS = 80;
+const SCENE_PANEL_NEBULA_CLOUD_BLUEPRINTS = [
+    {
+        sizeRatio: 1.44,
+        left: 30,
+        top: 60,
+        duration: 52,
+        delay: 0,
+        opacity: 0.36,
+        blur: 42,
+        rotationStart: "-18deg",
+        rotationMid: "4deg",
+        rotationEnd: "26deg",
+        scaleStart: 0.92,
+        scaleMid: 1.18,
+        scaleEnd: 0.9,
+        colorPrimary: "rgba(126, 196, 248, 0.32)",
+        colorSecondary: "rgba(214, 156, 242, 0.24)",
+    },
+    {
+        sizeRatio: 1.12,
+        left: 64,
+        top: 46,
+        duration: 46,
+        delay: -12.5,
+        opacity: 0.32,
+        blur: 36,
+        rotationStart: "14deg",
+        rotationMid: "36deg",
+        rotationEnd: "58deg",
+        scaleStart: 0.88,
+        scaleMid: 1.1,
+        scaleEnd: 0.94,
+        colorPrimary: "rgba(108, 232, 198, 0.26)",
+        colorSecondary: "rgba(110, 184, 246, 0.28)",
+    },
+    {
+        sizeRatio: 0.94,
+        left: 22,
+        top: 38,
+        duration: 38,
+        delay: -7.5,
+        opacity: 0.34,
+        blur: 28,
+        rotationStart: "-8deg",
+        rotationMid: "18deg",
+        rotationEnd: "32deg",
+        scaleStart: 0.9,
+        scaleMid: 1.16,
+        scaleEnd: 0.96,
+        colorPrimary: "rgba(226, 166, 242, 0.26)",
+        colorSecondary: "rgba(104, 188, 242, 0.26)",
+    },
+];
+const SCENE_PANEL_NEBULA_STAR_BLUEPRINTS = [
+    { sizeRatio: 0.06, left: 18, top: 34, duration: 14, delay: -4, opacity: 0.66 },
+    { sizeRatio: 0.08, left: 46, top: 28, duration: 18, delay: -9, opacity: 0.58 },
+    { sizeRatio: 0.05, left: 64, top: 62, duration: 16, delay: -6, opacity: 0.62 },
+    { sizeRatio: 0.07, left: 74, top: 38, duration: 20, delay: -10, opacity: 0.54 },
+    { sizeRatio: 0.05, left: 36, top: 58, duration: 17, delay: -3.2, opacity: 0.6 },
+    { sizeRatio: 0.04, left: 54, top: 72, duration: 22, delay: -12.6, opacity: 0.5 },
+];
+let scenePanelRenderTimer = null;
+let scenePanelRenderPending = false;
+let scenePanelRenderLastReason = "update";
+let scenePanelRenderLastSource = "scene";
+let lastCollectedScenePanelState = null;
+let scenePanelUiWired = false;
+let scenePanelLayerMode = null;
+let scenePanelLayerReturnFocus = null;
+let scenePanelUpdateCueTimer = null;
+
+function isScenePanelCollapsed() {
+    const container = getScenePanelContainer?.();
+    if (!container) {
+        return false;
+    }
+    if (typeof container.attr === "function") {
+        const attr = container.attr("data-cs-collapsed");
+        return attr === "true";
+    }
+    if (container?.[0]) {
+        const attr = container[0].getAttribute("data-cs-collapsed");
+        return attr === "true";
+    }
+    return false;
+}
+
+function setScenePanelCollapsed(collapsed) {
+    const container = getScenePanelContainer?.();
+    if (container && typeof container.attr === "function") {
+        container.attr("data-cs-collapsed", collapsed ? "true" : "false");
+    } else if (container?.[0]) {
+        container[0].setAttribute("data-cs-collapsed", collapsed ? "true" : "false");
+    }
+    const toggle = getSceneCollapseToggle?.();
+    if (toggle && typeof toggle.attr === "function") {
+        toggle.attr("aria-expanded", collapsed ? "false" : "true");
+        toggle.attr("title", collapsed ? "Expand scene roster" : "Collapse scene roster");
+    } else if (toggle?.[0]) {
+        toggle[0].setAttribute("aria-expanded", collapsed ? "false" : "true");
+        toggle[0].setAttribute("title", collapsed ? "Expand scene roster" : "Collapse scene roster");
+    }
+    if (!collapsed) {
+        const element = toggle?.[0] || toggle;
+        if (element?.classList) {
+            element.classList.remove("cs-scene-panel__collapse-toggle--notify");
+        }
+        if (scenePanelUpdateCueTimer) {
+            clearTimeout(scenePanelUpdateCueTimer);
+            scenePanelUpdateCueTimer = null;
+        }
+    }
+    requestScenePanelRender("collapse", { immediate: true });
+}
+
+function toggleScenePanelCollapsed() {
+    setScenePanelCollapsed(!isScenePanelCollapsed());
+}
+
+function triggerScenePanelUpdateCue() {
+    if (!isScenePanelCollapsed()) {
+        return;
+    }
+    const toggle = getSceneCollapseToggle?.();
+    const element = toggle?.[0] || toggle;
+    if (!element || !element.classList) {
+        return;
+    }
+    element.classList.remove("cs-scene-panel__collapse-toggle--notify");
+    // Force reflow to restart animation when updates happen rapidly.
+    void element.offsetWidth; // eslint-disable-line no-void
+    element.classList.add("cs-scene-panel__collapse-toggle--notify");
+    const cleanup = () => {
+        element.classList.remove("cs-scene-panel__collapse-toggle--notify");
+        element.removeEventListener("animationend", cleanup);
+        if (scenePanelUpdateCueTimer) {
+            clearTimeout(scenePanelUpdateCueTimer);
+            scenePanelUpdateCueTimer = null;
+        }
+    };
+    element.addEventListener("animationend", cleanup);
+    if (scenePanelUpdateCueTimer) {
+        clearTimeout(scenePanelUpdateCueTimer);
+    }
+    scenePanelUpdateCueTimer = setTimeout(cleanup, 2500);
+}
+
+function maybeAutoExpandScenePanel(reason = "result") {
+    if (typeof document === "undefined") {
+        return;
+    }
+    const settings = getSettings?.();
+    const panelSettings = ensureScenePanelSettings(settings || {});
+    const shouldAutoOpen = reason === "stream"
+        ? panelSettings.autoOpenOnStream
+        : panelSettings.autoOpenOnResults;
+
+    if (!shouldAutoOpen) {
+        return;
+    }
+
+    if (!panelSettings.enabled) {
+        panelSettings.enabled = true;
+        updateScenePanelSettingControls(panelSettings);
+        setScenePanelCollapsed(false);
+        requestScenePanelRender("auto-open-enable", { immediate: true });
+        persistSettings(null, "info");
+        return;
+    }
+    if (!isScenePanelCollapsed()) {
+        return;
+    }
+    setScenePanelCollapsed(false);
+}
+
+function getRankingUpdatedAtForKey(bufKey) {
+    const normalizedKey = normalizeMessageKey(bufKey);
+    if (!normalizedKey) {
+        return null;
+    }
+    if (!(state.topSceneRankingUpdatedAt instanceof Map)) {
+        return null;
+    }
+    const timestamp = state.topSceneRankingUpdatedAt.get(normalizedKey);
+    return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function computeAnalyticsUpdatedAt({
+    events = [],
+    rankingUpdatedAt = null,
+    scene = null,
+    membership = null,
+    testers = null,
+} = {}) {
+    const candidates = [];
+    const addCandidate = (value) => {
+        if (Number.isFinite(value)) {
+            candidates.push(value);
+        }
+    };
+
+    if (Array.isArray(events)) {
+        events.forEach((event) => {
+            if (event && typeof event === "object") {
+                addCandidate(event.timestamp);
+            }
+        });
+    }
+
+    if (scene && typeof scene === "object") {
+        addCandidate(scene.updatedAt);
+        if (scene.lastEvent && typeof scene.lastEvent === "object") {
+            addCandidate(scene.lastEvent.timestamp);
+        }
+    }
+
+    if (membership && typeof membership === "object") {
+        addCandidate(membership.updatedAt);
+    }
+
+    if (testers && typeof testers === "object") {
+        addCandidate(testers.updatedAt);
+        if (Array.isArray(testers.entries)) {
+            testers.entries.forEach((entry) => {
+                if (!entry || typeof entry !== "object") {
+                    return;
+                }
+                addCandidate(entry.updatedAt);
+                if (entry.lastEvent && typeof entry.lastEvent === "object") {
+                    addCandidate(entry.lastEvent.timestamp);
+                }
+            });
+        }
+    }
+
+    addCandidate(rankingUpdatedAt);
+
+    if (!candidates.length) {
+        return 0;
+    }
+
+    return Math.max(...candidates);
+}
+
+function collectScenePanelState(options = {}) {
+    if (options?.source === "tester" && lastCollectedScenePanelState) {
+        return lastCollectedScenePanelState;
+    }
+    const settings = getSettings?.();
+    const panelSettings = ensureScenePanelSettings(settings || {});
+    const now = Date.now();
+    const sceneSnapshot = getCurrentSceneSnapshot();
+    const testersSnapshot = getLiveTesterOutputsSnapshot();
+    let messageState = null;
+    if (sceneSnapshot?.key && state.perMessageStates instanceof Map) {
+        messageState = state.perMessageStates.get(sceneSnapshot.key) || null;
+    }
+    if (!messageState && state.perMessageStates instanceof Map && state.perMessageStates.size > 0) {
+        messageState = Array.from(state.perMessageStates.values()).pop();
+    }
+    const derivedScene = deriveSceneRosterState({
+        messageState,
+        sceneSnapshot,
+        testerSnapshot: testersSnapshot,
+        now,
+    });
+    const scene = {
+        key: derivedScene.key,
+        messageId: derivedScene.messageId,
+        roster: derivedScene.roster,
+        lastEvent: derivedScene.lastEvent,
+        updatedAt: derivedScene.updatedAt,
+    };
+    const displayNames = derivedScene.displayNames;
+    const testers = testersSnapshot;
+    const ranking = getLastTopCharacters(4);
+
+    const streamingKey = state.currentGenerationKey
+        ? normalizeMessageKey(state.currentGenerationKey)
+        : null;
+
+    const getBufferForKey = (key) => {
+        if (!key || !(state.perMessageBuffers instanceof Map)) {
+            return "";
+        }
+        return state.perMessageBuffers.get(key) || "";
+    };
+
+    const streamingBuffer = streamingKey ? getBufferForKey(streamingKey) : "";
+    const hasStreamingBuffer = Boolean(streamingBuffer.trim().length);
+
+    let hasStreamingEvents = false;
+    if (streamingKey && Array.isArray(state.recentDecisionEvents)) {
+        hasStreamingEvents = state.recentDecisionEvents.some((event) => {
+            if (!event || !event.messageKey) {
+                return false;
+            }
+            const normalizedEventKey = normalizeMessageKey(event.messageKey);
+            return normalizedEventKey === streamingKey;
+        });
+    }
+
+    const shouldUseStreamingKey = Boolean(streamingKey && (hasStreamingBuffer || hasStreamingEvents));
+
+    let activeKey = shouldUseStreamingKey
+        ? streamingKey
+        : getLastStatsMessageKey();
+    if (typeof activeKey === "string" && activeKey.startsWith("tester:")) {
+        activeKey = null;
+    }
+
+    const buffer = shouldUseStreamingKey
+        ? streamingBuffer
+        : getBufferForKey(activeKey);
+
+    const stats = activeKey && state.messageStats instanceof Map
+        ? state.messageStats.get(activeKey) || null
+        : null;
+    const matches = activeKey
+        ? getCachedMatchesForBuffer(activeKey, buffer.length)
+        : [];
+    const rankingForMessage = activeKey && state.topSceneRanking instanceof Map
+        ? state.topSceneRanking.get(activeKey) || []
+        : [];
+
+    const events = Array.isArray(state.recentDecisionEvents)
+        ? state.recentDecisionEvents.filter((event) => {
+            if (!event) {
+                return false;
+            }
+            if (!event.messageKey) {
+                return true;
+            }
+            if (!activeKey) {
+                return !event.messageKey.startsWith("tester:");
+            }
+            const normalizedEventKey = normalizeMessageKey(event.messageKey);
+            if (normalizedEventKey && normalizedEventKey.startsWith("tester:")) {
+                return false;
+            }
+            return normalizedEventKey === activeKey;
+        })
+        : [];
+
+    const eventsByCharacter = new Map();
+    const MAX_RANKING_EVENTS = 2;
+    events.forEach((event) => {
+        if (!event || typeof event !== "object") {
+            return;
+        }
+        const normalizedName = normalizeRosterKey(event.normalized || event.name);
+        if (!normalizedName) {
+            return;
+        }
+        const list = eventsByCharacter.get(normalizedName) || [];
+        list.push(event);
+        eventsByCharacter.set(normalizedName, list);
+    });
+
+    const latestRankingUpdatedAt = Number.isFinite(state.latestTopRanking?.updatedAt)
+        ? state.latestTopRanking.updatedAt
+        : null;
+    const activeRankingUpdatedAt = ranking.length
+        ? latestRankingUpdatedAt
+        : getRankingUpdatedAtForKey(activeKey) ?? latestRankingUpdatedAt;
+
+    const updatedAt = computeAnalyticsUpdatedAt({
+        events,
+        rankingUpdatedAt: activeRankingUpdatedAt,
+        scene,
+        membership: null,
+        testers,
+    });
+
+    const profileForCoverage = getActiveProfile();
+    const hasBufferText = typeof buffer === "string" && buffer.trim().length > 0;
+    let coverage;
+    if (hasBufferText) {
+        coverage = analyzeCoverageDiagnostics(buffer, profileForCoverage);
+    } else {
+        const fallbackCoverage = state.lastTesterReport?.coverage || state.coverageDiagnostics;
+        coverage = cloneCoverageDiagnostics(fallbackCoverage);
+    }
+
+    const rankingSource = ranking.length ? ranking : rankingForMessage.slice(0, 4);
+    const preparedRanking = rankingSource.map((entry) => {
+        if (!entry || typeof entry !== "object") {
+            return entry;
+        }
+        const normalizedName = normalizeRosterKey(entry.normalized || entry.name);
+        const characterEvents = normalizedName ? eventsByCharacter.get(normalizedName) : null;
+        const trimmedEvents = characterEvents && characterEvents.length
+            ? characterEvents.slice(-MAX_RANKING_EVENTS)
+            : [];
+        return {
+            ...entry,
+            events: trimmedEvents,
+        };
+    });
+
+    const panelState = {
+        scene,
+        membership: null,
+        settings: panelSettings,
+        ranking: preparedRanking,
+        displayNames,
+        analytics: {
+            messageKey: activeKey,
+            buffer,
+            stats,
+            ranking: rankingForMessage,
+            events,
+            matches,
+            tokenCount: Number.isFinite(matches?.tokenCount) ? matches.tokenCount : null,
+            minTokenIndex: Number.isFinite(matches?.minTokenIndex) ? matches.minTokenIndex : null,
+            tokenizerId: matches?.tokenizerId || null,
+            updatedAt,
+        },
+        now,
+        isStreaming: Boolean(state.currentGenerationKey && shouldUseStreamingKey),
+        collapsed: isScenePanelCollapsed(),
+        testers,
+        coverage,
+    };
+    lastCollectedScenePanelState = panelState;
+    return panelState;
+}
+
+function performScenePanelRender(options = {}) {
+    if (typeof document === "undefined") {
+        return;
+    }
+    if (options?.source === "tester") {
+        return;
+    }
+    const container = getScenePanelContainer?.();
+    if (!container || (typeof container.length === "number" && container.length === 0)) {
+        return;
+    }
+    const panelState = collectScenePanelState(options);
+    renderScenePanel(panelState, options);
+}
+
+function requestScenePanelRender(reason = "update", { immediate = false, source = "scene" } = {}) {
+    if (typeof document === "undefined") {
+        return;
+    }
+    if (source === "tester") {
+        return;
+    }
+    const container = getScenePanelContainer?.();
+    if (!container || (typeof container.length === "number" && container.length === 0)) {
+        return;
+    }
+    scenePanelRenderLastReason = reason;
+    scenePanelRenderLastSource = source;
+    const shouldImmediate = immediate || reason === "mount" || reason === "collapse";
+    if (reason !== "collapse" && reason !== "mount") {
+        triggerScenePanelUpdateCue();
+    }
+    const options = { reason, source };
+    if (shouldImmediate) {
+        if (scenePanelRenderTimer) {
+            clearTimeout(scenePanelRenderTimer);
+            scenePanelRenderTimer = null;
+        }
+        scenePanelRenderPending = false;
+        performScenePanelRender(options);
+        return;
+    }
+    if (scenePanelRenderTimer) {
+        scenePanelRenderPending = true;
+        return;
+    }
+    scenePanelRenderPending = false;
+    scenePanelRenderTimer = setTimeout(() => {
+        scenePanelRenderTimer = null;
+        performScenePanelRender({
+            reason: scenePanelRenderLastReason,
+            source: scenePanelRenderLastSource,
+        });
+        if (scenePanelRenderPending) {
+            scenePanelRenderPending = false;
+            requestScenePanelRender("follow-up", { source: scenePanelRenderLastSource });
+        }
+    }, SCENE_PANEL_RENDER_DEBOUNCE_MS);
+}
+
+function initializeScenePanelAmbient() {
+    if (typeof document === "undefined") {
+        return;
+    }
+
+    const ambient = document.querySelector("#cs-scene-panel [data-scene-panel=\"ambient\"]");
+    if (!ambient || ambient.dataset.nebulaInitialized === "true") {
+        return;
+    }
+
+    ambient.dataset.nebulaInitialized = "true";
+    ambient.textContent = "";
+
+    const host = ambient.parentElement || ambient;
+
+    const clouds = [];
+    for (const blueprint of SCENE_PANEL_NEBULA_CLOUD_BLUEPRINTS) {
+        const layer = document.createElement("div");
+        if (!layer) {
+            continue;
+        }
+        layer.className = "nebula-cloud";
+        layer.dataset.sizeRatio = String(blueprint.sizeRatio);
+        layer.style.setProperty("--cloud-left", `${blueprint.left}%`);
+        layer.style.setProperty("--cloud-top", `${blueprint.top}%`);
+        layer.style.setProperty("--cloud-duration", `${blueprint.duration}s`);
+        layer.style.setProperty("--cloud-delay", `${blueprint.delay}s`);
+        layer.style.setProperty("--cloud-opacity", `${blueprint.opacity}`);
+        layer.style.setProperty("--cloud-blur", `${blueprint.blur}px`);
+        layer.style.setProperty("--cloud-rotation-start", blueprint.rotationStart);
+        layer.style.setProperty("--cloud-rotation-mid", blueprint.rotationMid);
+        layer.style.setProperty("--cloud-rotation-end", blueprint.rotationEnd);
+        layer.style.setProperty("--cloud-scale-start", `${blueprint.scaleStart}`);
+        layer.style.setProperty("--cloud-scale-mid", `${blueprint.scaleMid}`);
+        layer.style.setProperty("--cloud-scale-end", `${blueprint.scaleEnd}`);
+        layer.style.setProperty("--cloud-color-primary", blueprint.colorPrimary);
+        layer.style.setProperty("--cloud-color-secondary", blueprint.colorSecondary);
+        ambient.appendChild(layer);
+        clouds.push({ element: layer, blueprint });
+    }
+
+    const stars = [];
+    for (const blueprint of SCENE_PANEL_NEBULA_STAR_BLUEPRINTS) {
+        const star = document.createElement("div");
+        if (!star) {
+            continue;
+        }
+        star.className = "nebula-star";
+        star.dataset.sizeRatio = String(blueprint.sizeRatio);
+        star.style.setProperty("--star-left", `${blueprint.left}%`);
+        star.style.setProperty("--star-top", `${blueprint.top}%`);
+        star.style.setProperty("--star-duration", `${blueprint.duration}s`);
+        star.style.setProperty("--star-delay", `${blueprint.delay}s`);
+        star.style.setProperty("--star-opacity", `${blueprint.opacity}`);
+        ambient.appendChild(star);
+        stars.push({ element: star, blueprint });
+    }
+
+    const updateDimensions = () => {
+        if (!host || typeof host.getBoundingClientRect !== "function") {
+            return;
+        }
+        const { width, height } = host.getBoundingClientRect();
+        const reference = Math.max(width, height, 1);
+
+        for (const entry of clouds) {
+            if (!entry?.element) {
+                continue;
+            }
+            const baseSize = reference * entry.blueprint.sizeRatio;
+            entry.element.style.setProperty("--cloud-size", `${baseSize}px`);
+        }
+
+        for (const entry of stars) {
+            if (!entry?.element) {
+                continue;
+            }
+            const baseSize = reference * entry.blueprint.sizeRatio;
+            entry.element.style.setProperty("--star-size", `${baseSize}px`);
+        }
+    };
+
+    updateDimensions();
+
+    if (typeof ResizeObserver === "function" && host) {
+        const observer = new ResizeObserver(updateDimensions);
+        observer.observe(host);
+    } else if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+        window.addEventListener("resize", updateDimensions, { passive: true });
+    }
+}
+
+function initializeScenePanelUI() {
+    if (scenePanelUiWired) {
+        return;
+    }
+    const toggle = getSceneCollapseToggle?.();
+    if (toggle && typeof toggle.on === "function") {
+        toggle.on("click", () => toggleScenePanelCollapsed());
+    } else if (toggle?.[0]) {
+        toggle[0].addEventListener("click", toggleScenePanelCollapsed);
+    }
+    const container = getScenePanelContainer?.();
+    if (container) {
+        if (typeof container.attr === "function") {
+            if (container.attr("data-cs-collapsed") == null) {
+                container.attr("data-cs-collapsed", "false");
+            }
+        } else if (container?.[0] && !container[0].hasAttribute("data-cs-collapsed")) {
+            container[0].setAttribute("data-cs-collapsed", "false");
+        }
+    }
+    initializeScenePanelAmbient();
+    scenePanelUiWired = true;
+}
+
+function getScenePanelLayerElement() {
+    if (typeof document === "undefined") {
+        return null;
+    }
+    return document.getElementById("cs-scene-panel-layer");
+}
+
+function getScenePanelLayerBodyElement() {
+    const layer = getScenePanelLayerElement();
+    if (!layer) {
+        return null;
+    }
+    return layer.querySelector('[data-scene-panel="sheet-body"]');
+}
+
+function getScenePanelLayerTitleElement() {
+    const layer = getScenePanelLayerElement();
+    if (!layer) {
+        return null;
+    }
+    return layer.querySelector('[data-scene-panel="layer-title"]');
+}
+
+function getScenePanelLayerDescriptionElement() {
+    const layer = getScenePanelLayerElement();
+    if (!layer) {
+        return null;
+    }
+    return layer.querySelector('[data-scene-panel="layer-description"]');
+}
+
+function openScenePanelLayer({ title, description, mode } = {}) {
+    if (typeof document === "undefined") {
+        return null;
+    }
+    const layer = getScenePanelLayerElement();
+    if (!layer) {
+        return null;
+    }
+    scenePanelLayerMode = mode || null;
+    const titleEl = getScenePanelLayerTitleElement();
+    if (titleEl && typeof title === "string") {
+        titleEl.textContent = title;
+    }
+    const descriptionEl = getScenePanelLayerDescriptionElement();
+    if (descriptionEl && typeof description === "string") {
+        descriptionEl.textContent = description;
+    }
+    layer.hidden = false;
+    layer.setAttribute("aria-hidden", "false");
+    if (typeof document.activeElement !== "undefined") {
+        scenePanelLayerReturnFocus = document.activeElement;
+    }
+    const closeButton = layer.querySelector('[data-scene-panel="close-layer"]');
+    setTimeout(() => {
+        if (closeButton && typeof closeButton.focus === "function") {
+            closeButton.focus();
+        }
+    }, 0);
+    rerenderScenePanelLayer();
+    return layer;
+}
+
+function closeScenePanelLayer({ restoreFocus = true } = {}) {
+    const layer = getScenePanelLayerElement();
+    if (layer) {
+        layer.setAttribute("aria-hidden", "true");
+        layer.hidden = true;
+    }
+    const focusTarget = scenePanelLayerReturnFocus;
+    scenePanelLayerMode = null;
+    scenePanelLayerReturnFocus = null;
+    if (restoreFocus && focusTarget && typeof focusTarget.focus === "function") {
+        try {
+            focusTarget.focus();
+        } catch (err) {
+        }
+    }
+}
+
+function isScenePanelLayerOpen() {
+    const layer = getScenePanelLayerElement();
+    return Boolean(layer && !layer.hidden);
+}
+
+function rerenderScenePanelLayer() {
+    if (!scenePanelLayerMode) {
+        return;
+    }
+    if (scenePanelLayerMode === "roster") {
+        renderSceneRosterManagerLayer();
+        return;
+    }
+    if (scenePanelLayerMode === "log") {
+        renderSceneLogLayer();
+        return;
+    }
+    if (scenePanelLayerMode === "settings") {
+        renderSceneSettingsLayer();
+    }
+}
+
+function formatRosterManagerMeta(member, now) {
+    const parts = [];
+    if (member.active) {
+        parts.push("Active now");
+    } else if (Number.isFinite(member.lastSeenAt)) {
+        parts.push(`Seen ${formatRelativeTime(member.lastSeenAt, now) || "recently"}`);
+    } else {
+        parts.push("Inactive");
+    }
+    if (Number.isFinite(member.joinedAt)) {
+        const joined = formatRelativeTime(member.joinedAt, now);
+        if (joined) {
+            parts.push(`Joined ${joined}`);
+        }
+    }
+    return parts.join(" • ");
+}
+
+function renderSceneRosterManagerLayer() {
+    const body = getScenePanelLayerBodyElement();
+    if (!body) {
+        return;
+    }
+    body.textContent = "";
+    const sceneSnapshot = typeof getCurrentSceneSnapshot === "function"
+        ? getCurrentSceneSnapshot()
+        : null;
+    const members = Array.isArray(sceneSnapshot?.roster) ? sceneSnapshot.roster.slice() : [];
+    const now = Date.now();
+    members.sort((a, b) => {
+        if ((a?.active ? 1 : 0) !== (b?.active ? 1 : 0)) {
+            return a?.active ? -1 : 1;
+        }
+        const aSeen = Number.isFinite(a?.lastSeenAt) ? a.lastSeenAt : 0;
+        const bSeen = Number.isFinite(b?.lastSeenAt) ? b.lastSeenAt : 0;
+        return bSeen - aSeen;
+    });
+    const activeCount = members.filter((member) => member?.active).length;
+    const summary = document.createElement("div");
+    summary.className = "cs-scene-manager__summary";
+    summary.textContent = `Active: ${activeCount} • Tracked: ${members.length}`;
+    body.appendChild(summary);
+    if (!members.length) {
+        const empty = document.createElement("div");
+        empty.className = "cs-scene-manager__empty";
+        empty.textContent = "No characters are currently tracked. Add a name to prime the roster.";
+        body.appendChild(empty);
+    } else {
+        const list = document.createElement("ul");
+        list.className = "cs-scene-manager__list";
+        members.forEach((member) => {
+            if (!member) {
+                return;
+            }
+            const item = document.createElement("li");
+            item.className = "cs-scene-manager__row";
+            item.dataset.character = member.normalized || member.name || "";
+            const identity = document.createElement("div");
+            identity.className = "cs-scene-manager__identity";
+            const name = document.createElement("span");
+            name.className = "cs-scene-manager__name";
+            name.textContent = member.name || member.normalized || "Unknown";
+            identity.appendChild(name);
+            const meta = document.createElement("span");
+            meta.className = "cs-scene-manager__meta";
+            meta.textContent = formatRosterManagerMeta(member, now);
+            identity.appendChild(meta);
+            item.appendChild(identity);
+            const actions = document.createElement("div");
+            actions.className = "cs-scene-manager__actions";
+            const toggle = document.createElement("button");
+            toggle.type = "button";
+            toggle.className = "cs-scene-manager__toggle";
+            toggle.dataset.action = "toggle-active";
+            toggle.dataset.name = member.name || member.normalized || "";
+            toggle.textContent = member.active ? "Mark inactive" : "Reactivate";
+            actions.appendChild(toggle);
+            const remove = document.createElement("button");
+            remove.type = "button";
+            remove.className = "cs-scene-manager__remove";
+            remove.dataset.action = "remove-member";
+            remove.dataset.name = member.name || member.normalized || "";
+            remove.textContent = "Remove";
+            actions.appendChild(remove);
+            item.appendChild(actions);
+            list.appendChild(item);
+        });
+        body.appendChild(list);
+    }
+    const form = document.createElement("form");
+    form.className = "cs-scene-manager__form";
+    form.id = "cs-scene-manager-form";
+    form.dataset.scenePanel = "manager-form";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.name = "character";
+    input.placeholder = "Add character name…";
+    input.autocomplete = "off";
+    input.className = "cs-scene-manager__input";
+    form.appendChild(input);
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.className = "cs-scene-manager__submit";
+    submit.textContent = "Add to roster";
+    form.appendChild(submit);
+    body.appendChild(form);
+}
+
+function renderSceneLogLayer() {
+    const body = getScenePanelLayerBodyElement();
+    if (!body) {
+        return;
+    }
+    body.textContent = "";
+    const panelState = collectScenePanelState();
+    const analytics = panelState?.analytics || {};
+    const events = Array.isArray(analytics.events) ? analytics.events.slice(-50) : [];
+    const now = Number.isFinite(panelState?.now) ? panelState.now : Date.now();
+    const summary = document.createElement("div");
+    summary.className = "cs-scene-manager__summary";
+    const updatedCopy = formatRelativeTime(analytics.updatedAt, now) || "just now";
+    const charCount = typeof analytics.buffer === "string" ? analytics.buffer.length : 0;
+    summary.textContent = `Last updated ${updatedCopy} • Buffer ${charCount} chars • Events ${events.length}`;
+    body.appendChild(summary);
+    const stats = analytics.stats instanceof Map ? analytics.stats : null;
+    if (stats && stats.size) {
+        const statsList = document.createElement("ul");
+        statsList.className = "cs-scene-log__stats";
+        Array.from(stats.entries()).slice(0, 8).forEach(([normalized, count]) => {
+            const item = document.createElement("li");
+            const name = panelState.displayNames?.get(normalized) || normalized;
+            item.textContent = `${name} × ${count}`;
+            statsList.appendChild(item);
+        });
+        body.appendChild(statsList);
+    }
+    if (!events.length) {
+        const empty = document.createElement("div");
+        empty.className = "cs-scene-manager__empty";
+        empty.textContent = panelState?.isStreaming
+            ? "Awaiting detections for this message…"
+            : "No live diagnostics recorded yet.";
+        body.appendChild(empty);
+        return;
+    }
+    const list = document.createElement("div");
+    list.className = "cs-scene-layer__events";
+    events.forEach((entry) => {
+        if (!entry || typeof entry !== "object") {
+            return;
+        }
+        const wrapper = document.createElement("div");
+        wrapper.className = "cs-scene-log__event";
+        if (entry.type) {
+            wrapper.dataset.eventType = entry.type;
+        }
+        const title = document.createElement("div");
+        title.className = "cs-scene-log__event-title";
+        if (entry.type === "switch") {
+            const folder = entry.outfit?.folder ? ` → ${entry.outfit.folder}` : "";
+            title.textContent = `Switch${folder}`;
+        } else if (entry.type === "skipped") {
+            const reason = describeSkipReason(entry.reason);
+            const name = entry.name ? ` ${entry.name}` : "";
+            title.textContent = `Skipped${name} · ${reason}`;
+        } else if (entry.type === "veto") {
+            title.textContent = `Veto · ${entry.match || "unknown"}`;
+        } else {
+            title.textContent = entry.type || "Event";
+        }
+        wrapper.appendChild(title);
+        const metaParts = [];
+        if (entry.name && entry.type !== "skipped") {
+            metaParts.push(entry.name);
+        }
+        if (entry.matchKind) {
+            metaParts.push(entry.matchKind);
+        }
+        if (Number.isFinite(entry.charIndex)) {
+            metaParts.push(`#${entry.charIndex + 1}`);
+        }
+        if (entry.outfit?.label) {
+            metaParts.push(entry.outfit.label);
+        }
+        const when = formatRelativeTime(entry.timestamp, now);
+        if (when) {
+            metaParts.push(when);
+        }
+        if (metaParts.length) {
+            const meta = document.createElement("div");
+            meta.className = "cs-scene-log__event-meta";
+            meta.textContent = metaParts.join(" • ");
+            wrapper.appendChild(meta);
+        }
+        list.appendChild(wrapper);
+    });
+    body.appendChild(list);
+}
+
+function renderSceneSettingsLayer() {
+    const body = getScenePanelLayerBodyElement();
+    if (!body) {
+        return;
+    }
+    body.textContent = "";
+    const settings = ensureScenePanelSettings(getSettings?.() || {});
+    const sections = settings.sections || {};
+
+    const container = document.createElement("div");
+    container.className = "cs-scene-settings";
+
+    const intro = document.createElement("p");
+    intro.className = "cs-scene-settings__intro";
+    intro.textContent = "Tune the scene panel layout without leaving chat. Changes save automatically.";
+    container.appendChild(intro);
+
+    const createToggle = ({ id, label, description, checked, onChange }) => {
+        const wrapper = document.createElement("label");
+        wrapper.className = "cs-scene-settings__toggle";
+        wrapper.setAttribute("for", id);
+        const input = document.createElement("input");
+        input.id = id;
+        input.type = "checkbox";
+        input.className = "cs-scene-settings__checkbox";
+        input.checked = Boolean(checked);
+        input.addEventListener("change", (event) => {
+            try {
+                onChange(Boolean(event.target?.checked));
+            } catch (err) {
+                console.warn(`${logPrefix} Failed to update scene panel setting from in-panel controls.`, err);
+            }
+        });
+        wrapper.appendChild(input);
+        const copy = document.createElement("div");
+        copy.className = "cs-scene-settings__toggle-copy";
+        const title = document.createElement("span");
+        title.className = "cs-scene-settings__toggle-label";
+        title.textContent = label;
+        copy.appendChild(title);
+        if (description) {
+            const detail = document.createElement("span");
+            detail.className = "cs-scene-settings__toggle-description";
+            detail.textContent = description;
+            copy.appendChild(detail);
+        }
+        wrapper.appendChild(copy);
+        return wrapper;
+    };
+
+    const behaviorGroup = document.createElement("div");
+    behaviorGroup.className = "cs-scene-settings__group";
+    const behaviorTitle = document.createElement("h5");
+    behaviorTitle.className = "cs-scene-settings__group-title";
+    behaviorTitle.textContent = "Auto-open behavior";
+    behaviorGroup.appendChild(behaviorTitle);
+    behaviorGroup.appendChild(createToggle({
+        id: "cs-scene-settings-auto-stream",
+        label: "Open when streaming starts",
+        description: "Expand the side panel whenever a new generation begins streaming.",
+        checked: settings.autoOpenOnStream,
+        onChange: (checked) => applyScenePanelAutoOpenOnStreamSetting(checked),
+    }));
+    behaviorGroup.appendChild(createToggle({
+        id: "cs-scene-settings-auto-results",
+        label: "Open for new results",
+        description: "Pop the panel open whenever detection results arrive.",
+        checked: settings.autoOpenOnResults,
+        onChange: (checked) => applyScenePanelAutoOpenResultsSetting(checked),
+    }));
+    container.appendChild(behaviorGroup);
+
+    const contentGroup = document.createElement("div");
+    contentGroup.className = "cs-scene-settings__group";
+    const contentTitle = document.createElement("h5");
+    contentTitle.className = "cs-scene-settings__group-title";
+    contentTitle.textContent = "Panel content";
+    contentGroup.appendChild(contentTitle);
+    contentGroup.appendChild(createToggle({
+        id: "cs-scene-settings-section-roster",
+        label: "Show roster section",
+        description: "Keep the roster list visible next to chat.",
+        checked: sections.roster !== false,
+        onChange: (checked) => applyScenePanelSectionSetting("roster", checked),
+    }));
+    contentGroup.appendChild(createToggle({
+        id: "cs-scene-settings-section-active",
+        label: "Show active characters section",
+        description: "Display focus lock controls and current participants.",
+        checked: sections.activeCharacters !== false,
+        onChange: (checked) => applyScenePanelSectionSetting("activeCharacters", checked),
+    }));
+    contentGroup.appendChild(createToggle({
+        id: "cs-scene-settings-section-log",
+        label: "Show live log section",
+        description: "Include the live detection event feed inside the panel.",
+        checked: sections.liveLog !== false,
+        onChange: (checked) => applyScenePanelSectionSetting("liveLog", checked),
+    }));
+    contentGroup.appendChild(createToggle({
+        id: "cs-scene-settings-section-coverage",
+        label: "Show coverage suggestions",
+        description: "Surface vocabulary gaps directly alongside the roster.",
+        checked: sections.coverage !== false,
+        onChange: (checked) => applyScenePanelSectionSetting("coverage", checked),
+    }));
+    contentGroup.appendChild(createToggle({
+        id: "cs-scene-settings-auto-pin",
+        label: "Auto-pin top active character",
+        description: "Keep the most recent match highlighted for quick review.",
+        checked: settings.autoPinActive !== false,
+        onChange: (checked) => applyScenePanelAutoPinSetting(checked),
+    }));
+    contentGroup.appendChild(createToggle({
+        id: "cs-scene-settings-show-avatars",
+        label: "Show roster avatars",
+        description: "Use character thumbnails in the roster when available.",
+        checked: settings.showRosterAvatars,
+        onChange: (checked) => applyScenePanelShowAvatarsSetting(checked),
+    }));
+    container.appendChild(contentGroup);
+
+    const openFullSettings = document.createElement("button");
+    openFullSettings.id = "cs-scene-panel-settings-open-extension";
+    openFullSettings.type = "button";
+    openFullSettings.className = "cs-scene-panel__text-button cs-scene-settings__link";
+    openFullSettings.textContent = "Open full extension settings";
+    container.appendChild(openFullSettings);
+
+    body.appendChild(container);
+}
+
+function syncSceneRosterFromMembership({ message } = {}) {
+    const now = Date.now();
+    const sceneSnapshot = typeof getCurrentSceneSnapshot === "function"
+        ? getCurrentSceneSnapshot()
+        : null;
+    const testersSnapshot = typeof getLiveTesterOutputsSnapshot === "function"
+        ? getLiveTesterOutputsSnapshot()
+        : null;
+    let messageState = null;
+    if (sceneSnapshot?.key && state.perMessageStates instanceof Map) {
+        messageState = state.perMessageStates.get(sceneSnapshot.key) || null;
+    }
+    if (!messageState && state.perMessageStates instanceof Map && state.perMessageStates.size > 0) {
+        messageState = Array.from(state.perMessageStates.values()).pop();
+    }
+    const derived = deriveSceneRosterState({
+        messageState,
+        sceneSnapshot,
+        testerSnapshot: testersSnapshot,
+        now,
+    });
+    applySceneRosterUpdate({
+        key: derived.key,
+        messageId: derived.messageId,
+        roster: derived.roster,
+        displayNames: derived.displayNames,
+        lastMatch: derived.lastEvent,
+        updatedAt: now,
+        turnsByMember: messageState?.rosterTurns,
+        turnsRemaining: messageState?.defaultRosterTTL,
+    });
+    requestScenePanelRender("roster-manager", { immediate: true });
+    if (message) {
+        showStatus(message, "success");
+    }
+}
+
+function buildSceneLogCopy(panelState = collectScenePanelState()) {
+    if (!panelState || typeof panelState !== "object") {
+        return "No live events recorded yet.";
+    }
+    const analytics = panelState.analytics || {};
+    const events = Array.isArray(analytics.events) ? analytics.events : [];
+    const matches = Array.isArray(analytics.matches) ? analytics.matches : [];
+    const stats = analytics.stats instanceof Map ? analytics.stats : null;
+    const ranking = Array.isArray(analytics.ranking) ? analytics.ranking : [];
+    const rosterEntries = Array.isArray(panelState.scene?.roster) ? panelState.scene.roster : [];
+    const lines = [];
+
+    lines.push("Scene Panel Report");
+    const updatedAt = Number.isFinite(analytics.updatedAt) ? analytics.updatedAt : null;
+    if (updatedAt) {
+        lines.push(`Updated: ${new Date(updatedAt).toLocaleString()}`);
+    }
+    if (analytics.messageKey) {
+        lines.push(`Message key: ${analytics.messageKey}`);
+    }
+    lines.push("");
+
+    const buffer = typeof analytics.buffer === "string" ? analytics.buffer : "";
+    lines.push("Analyzed Buffer:");
+    lines.push(buffer ? buffer : "(empty)");
+    lines.push("");
+
+    const now = Number.isFinite(panelState.now) ? panelState.now : Date.now();
+    const activeMembers = rosterEntries.map((entry) => ({
+        name: entry.name || entry.normalized || "Unknown",
+        active: entry.active !== false,
+        joinedAt: Number.isFinite(entry.joinedAt) ? entry.joinedAt : null,
+        lastSeenAt: Number.isFinite(entry.lastSeenAt) ? entry.lastSeenAt : null,
+        turnsRemaining: Number.isFinite(entry.turnsRemaining) ? Math.max(0, entry.turnsRemaining) : null,
+    }));
+    const inactiveMembers = rosterEntries
+        .filter((member) => member && member.active === false)
+        .map((member) => ({
+            name: member.name || member.normalized || "Unknown",
+            lastLeftAt: Number.isFinite(member.lastLeftAt) ? member.lastLeftAt : null,
+        }));
+
+    lines.push(`Scene Roster (${activeMembers.length}):`);
+    if (activeMembers.length) {
+        activeMembers.forEach((entry, idx) => {
+            const joined = entry.joinedAt ? formatRelativeTime(entry.joinedAt, now) : null;
+            const seen = entry.lastSeenAt ? formatRelativeTime(entry.lastSeenAt, now) : null;
+            const ttl = entry.turnsRemaining != null
+                ? `${entry.turnsRemaining} message${entry.turnsRemaining === 1 ? "" : "s"} left`
+                : "TTL unknown";
+            const metaParts = [];
+            if (joined) metaParts.push(`joined ${joined}`);
+            if (seen) metaParts.push(`seen ${seen}`);
+            metaParts.push(ttl);
+            lines.push(`  ${idx + 1}. ${entry.name} – ${metaParts.join(", ")}`);
+        });
+    } else {
+        lines.push("  (empty)");
+    }
+    if (inactiveMembers.length) {
+        lines.push("");
+        lines.push(`Inactive members (${inactiveMembers.length}):`);
+        inactiveMembers.forEach((entry, idx) => {
+            const left = entry.lastLeftAt ? formatRelativeTime(entry.lastLeftAt, now) : "time unknown";
+            lines.push(`  ${idx + 1}. ${entry.name} – left ${left}`);
+        });
+    }
+    lines.push("");
+
+    const mergedDetections = mergeDetectionsForReport({ matches, events });
+    const detectionSummary = summarizeDetections(mergedDetections);
+    lines.push("Detection Summary:");
+    if (detectionSummary.length) {
+        detectionSummary.forEach((item) => {
+            const kindBreakdown = Object.entries(item.kinds)
+                .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+                .map(([kind, count]) => `${kind}:${count}`)
+                .join(", ");
+            const priorityInfo = item.highestPriority != null ? `, highest priority ${item.highestPriority}` : "";
+            const rangeInfo = item.earliest != null
+                ? item.latest != null && item.latest !== item.earliest
+                    ? `, chars ${item.earliest}-${item.latest}`
+                    : `, char ${item.earliest}`
+                : "";
+            lines.push(`  - ${item.name}: ${item.total} detections (${kindBreakdown || "none"}${priorityInfo}${rangeInfo})`);
+        });
+    } else {
+        lines.push("  (none)");
+    }
+    lines.push("");
+
+    lines.push("Switch & Event Timeline:");
+    if (events.length) {
+        events.forEach((event, idx) => {
+            const timestamp = Number.isFinite(event.timestamp)
+                ? new Date(event.timestamp).toLocaleString()
+                : "Timestamp unavailable";
+            const charPos = Number.isFinite(event.charIndex) ? event.charIndex + 1 : "?";
+            if (event.type === "switch") {
+                const detail = event.matchKind ? ` via ${event.matchKind}` : "";
+                const score = Number.isFinite(event.score) ? `, score ${event.score}` : "";
+                const outfitSummary = summarizeOutfitDecision(event.outfit, { separator: "; ", includeFolder: false });
+                const outfitNote = outfitSummary ? ` [${outfitSummary}]` : "";
+                lines.push(`  ${idx + 1}. [${timestamp}] SWITCH → ${event.folder || event.name}${detail} @ char ${charPos}${score}${outfitNote}`);
+            } else if (event.type === "veto") {
+                lines.push(`  ${idx + 1}. [${timestamp}] VETO – matched "${event.match}" @ char ${charPos}`);
+            } else {
+                const reason = describeSkipReason(event.reason);
+                const outfitSummary = summarizeOutfitDecision(event.outfit, { separator: "; ", includeFolder: false });
+                const outfitNote = outfitSummary ? ` [${outfitSummary}]` : "";
+                lines.push(`  ${idx + 1}. [${timestamp}] SKIP – ${event.name} (${event.matchKind || "unknown"}) because ${reason}${outfitNote}`);
+            }
+        });
+    } else {
+        lines.push("  (no recorded events)");
+    }
+    lines.push("");
+
+    const switchSummary = summarizeSwitchesForReport(events);
+    lines.push("Switch Summary:");
+    lines.push(`  Total switches: ${switchSummary.total}`);
+    if (switchSummary.uniqueCount > 0) {
+        lines.push(`  Unique costumes: ${switchSummary.uniqueCount} (${switchSummary.uniqueFolders.join(", ")})`);
+    } else {
+        lines.push("  Unique costumes: 0");
+    }
+    if (switchSummary.lastSwitch) {
+        const last = switchSummary.lastSwitch;
+        const charPos = Number.isFinite(last.charIndex) ? last.charIndex + 1 : "?";
+        const detail = last.matchKind ? ` via ${last.matchKind}` : "";
+        const score = Number.isFinite(last.score) ? `, score ${last.score}` : "";
+        const outfitSummary = summarizeOutfitDecision(last.outfit, { separator: "; ", includeFolder: false });
+        const outfitNote = outfitSummary ? ` [${outfitSummary}]` : "";
+        lines.push(`  Last switch: ${last.folder || last.name || "(unknown)"}${detail} @ char ${charPos}${score}${outfitNote}`);
+    } else {
+        lines.push("  Last switch: (none)");
+    }
+    if (switchSummary.topScores.length) {
+        lines.push("  Top switch scores:");
+        switchSummary.topScores.forEach((event, idx) => {
+            const charPos = Number.isFinite(event.charIndex) ? event.charIndex + 1 : "?";
+            const detail = event.matchKind ? ` via ${event.matchKind}` : "";
+            const outfitSummary = summarizeOutfitDecision(event.outfit, { separator: "; ", includeFolder: false });
+            const outfitNote = outfitSummary ? ` [${outfitSummary}]` : "";
+            lines.push(`    ${idx + 1}. ${event.folder || event.name || "(unknown)"} – ${event.score} (trigger: ${event.name}${detail}, char ${charPos})${outfitNote}`);
+        });
+    }
+    lines.push("");
+
+    const skipSummary = summarizeSkipReasonsForReport(events);
+    lines.push("Skip Reasons:");
+    if (skipSummary.length) {
+        skipSummary.forEach((item) => {
+            lines.push(`  - ${describeSkipReason(item.code)} (${item.code}): ${item.count}`);
+        });
+    } else {
+        lines.push("  (none)");
+    }
+    lines.push("");
+
+    if (stats && typeof stats.forEach === "function") {
+        const statEntries = Array.from(stats.entries ? stats.entries() : stats);
+        statEntries.sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0]), undefined, { sensitivity: "base" }));
+        lines.push("Detection Counts:");
+        if (statEntries.length) {
+            statEntries.forEach(([name, count]) => {
+                lines.push(`  - ${name}: ${count}`);
+            });
+        } else {
+            lines.push("  (none)");
+        }
+        lines.push("");
+    }
+
+    if (ranking.length) {
+        lines.push("Top Characters:");
+        ranking.slice(0, 4).forEach((entry, idx) => {
+            const rosterTag = entry.inSceneRoster ? " [scene roster]" : "";
+            const scorePart = Number.isFinite(entry.score) ? ` (score ${entry.score})` : "";
+            lines.push(`  ${idx + 1}. ${entry.name} – ${entry.count ?? 0} detections${rosterTag}${scorePart}`);
+        });
+        lines.push("");
+    }
+
+    return lines.join("\n");
+}
+
+async function copyScenePanelLog() {
+    if (typeof document === "undefined") {
+        return false;
+    }
+    const text = buildSceneLogCopy();
+    if (!text) {
+        return false;
+    }
+    try {
+        if (navigator?.clipboard?.writeText) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (err) {
+    }
+    try {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "true");
+        textarea.style.position = "absolute";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        textarea.remove();
+        return true;
+    } catch (err) {
+        return false;
+    }
+}
+
+function handleScenePanelManageRoster(event) {
+    event?.preventDefault?.();
+    openScenePanelLayer({
+        mode: "roster",
+        title: "Manage scene roster",
+        description: "Prime, reactivate, or remove characters from the live roster.",
+    });
+}
+
+function handleScenePanelClearRoster(event) {
+    event?.preventDefault?.();
+    if (!confirm("Clear the entire scene roster?")) {
+        return;
+    }
+    const { messageState } = resolveSceneManagerState();
+    if (messageState.sceneRoster instanceof Set) {
+        messageState.sceneRoster.clear();
+    }
+    if (messageState.rosterTurns instanceof Map) {
+        messageState.rosterTurns.clear();
+    }
+    if (messageState.removedRoster instanceof Set) {
+        messageState.removedRoster.clear();
+    }
+    syncSceneRosterFromMembership({ message: "Scene roster cleared." });
+    rerenderScenePanelLayer();
+}
+
+const handleScenePanelRefresh = createScenePanelRefreshHandler({
+    restoreLatestSceneOutcome,
+    requestScenePanelRender,
+    rerenderScenePanelLayer,
+    showStatus,
+    getCurrentSceneSnapshot,
+    getLatestStoredSceneTimestamp,
+});
+
+async function handleScenePanelFocusToggle(event) {
+    event?.preventDefault?.();
+    const settings = getSettings?.();
+    if (!settings) {
+        return;
+    }
+    const lockedName = String(settings?.focusLock?.character ?? "").trim();
+    if (lockedName) {
+        settings.focusLock.character = null;
+        await manualReset();
+        updateFocusLockUI();
+        persistSettings("Focus lock removed.", "info");
+        showStatus("Focus lock removed.", "info");
+        requestScenePanelRender("focus-lock", { immediate: true });
+        return;
+    }
+    const panelState = collectScenePanelState();
+    const ranking = Array.isArray(panelState?.ranking) ? panelState.ranking : [];
+    const sceneRoster = Array.isArray(panelState?.scene?.roster) ? panelState.scene.roster : [];
+    let candidate = ranking.find((entry) => entry?.name) || sceneRoster.find((entry) => entry && (entry.name || typeof entry === "string"));
+    if (candidate && typeof candidate === "object") {
+        candidate = candidate.name || candidate.normalized || null;
+    }
+    if (typeof candidate !== "string" || !candidate.trim()) {
+        showStatus("No recent characters to focus lock.", "info");
+        return;
+    }
+    const target = candidate.trim();
+    settings.focusLock.character = target;
+    await issueCostumeForName(target, { isLock: true });
+    updateFocusLockUI();
+    persistSettings(`Focus lock set to "${escapeHtml(target)}".`, "info");
+    showStatus(`Focus lock set to ${target}.`, "success");
+    requestScenePanelRender("focus-lock", { immediate: true });
+}
+
+function handleScenePanelExpandLog(event) {
+    event?.preventDefault?.();
+    openScenePanelLayer({
+        mode: "log",
+        title: "Live result log",
+        description: "Review the latest detection events and diagnostics.",
+    });
+}
+
+async function handleScenePanelCopyLog(event) {
+    event?.preventDefault?.();
+    const success = await copyScenePanelLog();
+    if (success) {
+        showStatus("Live log copied to clipboard.", "success");
+    } else {
+        showStatus("Unable to copy the live log.", "error");
+    }
+}
+
+function openExtensionSettingsView() {
+    let opened = false;
+    try {
+        const ctx = typeof getContext === "function"
+            ? getContext()
+            : window?.SillyTavern?.getContext?.();
+        if (ctx?.ui?.openExtensionSettings) {
+            ctx.ui.openExtensionSettings(extensionName);
+            opened = true;
+        } else if (ctx?.openExtensionSettings) {
+            ctx.openExtensionSettings(extensionName);
+            opened = true;
+        }
+    } catch (err) {
+    }
+    if (typeof document !== "undefined") {
+        const menuButton = document.querySelector('[data-menu="extensions"]');
+        if (menuButton) {
+            menuButton.dispatchEvent(new Event("click", { bubbles: true }));
+            opened = true;
+        }
+        const container = document.getElementById("costume-switcher-settings");
+        if (container) {
+            container.scrollIntoView({ behavior: "smooth", block: "start" });
+            opened = true;
+        }
+    }
+    return opened;
+}
+
+function handleScenePanelOpenSettings(event) {
+    event?.preventDefault?.();
+    openScenePanelLayer({
+        mode: "settings",
+        title: "Scene roster settings",
+        description: "Adjust auto-open behavior and choose which sections appear in the side panel.",
+    });
+}
+
+function handleSceneManagerSubmit(event) {
+    event?.preventDefault?.();
+    const form = event?.currentTarget;
+    const input = form?.querySelector(".cs-scene-manager__input");
+    const name = String(input?.value || "").trim();
+    if (!name) {
+        showStatus("Enter a character name to add.", "info");
+        return;
+    }
+    const { messageState } = resolveSceneManagerState();
+    const normalized = normalizeRosterKey(name);
+    if (!normalized) {
+        showStatus("Unable to add that name to the roster.", "error");
+        return;
+    }
+    if (!(messageState.sceneRoster instanceof Set)) {
+        messageState.sceneRoster = new Set();
+    }
+    messageState.sceneRoster.add(normalized);
+    if (messageState.removedRoster instanceof Set) {
+        messageState.removedRoster.delete(normalized);
+    }
+    const defaultTTL = sanitizeRosterTurnValue(messageState.defaultRosterTTL);
+    if (!(messageState.rosterTurns instanceof Map)) {
+        messageState.rosterTurns = new Map();
+    }
+    if (defaultTTL != null) {
+        messageState.rosterTurns.set(normalized, defaultTTL);
+    } else {
+        messageState.rosterTurns.delete(normalized);
+    }
+    if (input) {
+        input.value = "";
+    }
+    syncSceneRosterFromMembership({ message: `${escapeHtml(name)} added to the scene roster.` });
+    rerenderScenePanelLayer();
+}
+
+function handleSceneManagerToggle(event) {
+    event?.preventDefault?.();
+    const button = event?.currentTarget;
+    const name = String(button?.dataset?.name || "").trim();
+    if (!name) {
+        return;
+    }
+    const { messageState } = resolveSceneManagerState();
+    const normalized = normalizeRosterKey(name);
+    if (!normalized) {
+        return;
+    }
+    if (!(messageState.sceneRoster instanceof Set)) {
+        messageState.sceneRoster = new Set();
+    }
+    const isActive = messageState.sceneRoster.has(normalized);
+    const nextActive = !isActive;
+    if (nextActive) {
+        messageState.sceneRoster.add(normalized);
+        if (messageState.removedRoster instanceof Set) {
+            messageState.removedRoster.delete(normalized);
+        }
+        const defaultTTL = sanitizeRosterTurnValue(messageState.defaultRosterTTL);
+        if (!(messageState.rosterTurns instanceof Map)) {
+            messageState.rosterTurns = new Map();
+        }
+        if (defaultTTL != null) {
+            messageState.rosterTurns.set(normalized, defaultTTL);
+        }
+    } else {
+        messageState.sceneRoster.delete(normalized);
+        if (messageState.rosterTurns instanceof Map) {
+            messageState.rosterTurns.delete(normalized);
+        }
+    }
+    syncSceneRosterFromMembership({
+        message: nextActive
+            ? `${escapeHtml(name)} reactivated.`
+            : `${escapeHtml(name)} marked inactive.`,
+    });
+    rerenderScenePanelLayer();
+}
+
+function handleSceneManagerRemove(event) {
+    event?.preventDefault?.();
+    const button = event?.currentTarget;
+    const name = String(button?.dataset?.name || "").trim();
+    if (!name) {
+        return;
+    }
+    if (!confirm(`Remove ${name} from the scene roster?`)) {
+        return;
+    }
+    const { messageState } = resolveSceneManagerState();
+    const normalized = normalizeRosterKey(name);
+    if (normalized) {
+        if (messageState.sceneRoster instanceof Set) {
+            messageState.sceneRoster.delete(normalized);
+        }
+        if (messageState.rosterTurns instanceof Map) {
+            messageState.rosterTurns.delete(normalized);
+        }
+        if (!(messageState.removedRoster instanceof Set)) {
+            messageState.removedRoster = new Set();
+        }
+        messageState.removedRoster.add(normalized);
+    }
+    syncSceneRosterFromMembership({ message: `${escapeHtml(name)} removed from the scene roster.` });
+    rerenderScenePanelLayer();
+}
+
 
 // ======================================================================
 // UTILITY & HELPER FUNCTIONS
 // ======================================================================
+function resolveSceneManagerState() {
+    const sceneSnapshot = typeof getCurrentSceneSnapshot === "function"
+        ? getCurrentSceneSnapshot()
+        : null;
+    const normalizedSceneKey = sceneSnapshot?.key ? normalizeMessageKey(sceneSnapshot.key) : null;
+    if (!(state.perMessageStates instanceof Map)) {
+        state.perMessageStates = new Map();
+    }
+    let messageKey = normalizedSceneKey;
+    let messageState = messageKey ? state.perMessageStates.get(messageKey) || null : null;
+    if (!messageState && state.perMessageStates.size > 0) {
+        const lastEntry = Array.from(state.perMessageStates.entries()).pop();
+        if (lastEntry) {
+            [messageKey, messageState] = lastEntry;
+        }
+    }
+    if (!messageState) {
+        messageKey = normalizedSceneKey || `manual:${Date.now()}`;
+        messageState = {
+            sceneRoster: new Set(),
+            rosterTurns: new Map(),
+            defaultRosterTTL: null,
+            removedRoster: new Set(),
+        };
+        state.perMessageStates.set(messageKey, messageState);
+    } else {
+        if (!(messageState.sceneRoster instanceof Set)) {
+            messageState.sceneRoster = new Set(messageState.sceneRoster || []);
+        }
+        if (!(messageState.rosterTurns instanceof Map)) {
+            messageState.rosterTurns = new Map(messageState.rosterTurns || []);
+        }
+        if (!(messageState.removedRoster instanceof Set)) {
+            messageState.removedRoster = new Set(messageState.removedRoster || []);
+        }
+    }
+    return { sceneSnapshot, messageState, messageKey };
+}
+
 function escapeHtml(str) {
     if (typeof document === "undefined" || typeof document.createElement !== "function") {
         const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" };
@@ -1098,6 +2965,106 @@ function normalizeCostumeName(n) {
     const segments = s.split(/[\\/]+/).filter(Boolean);
     const base = segments.length ? segments[segments.length - 1] : s;
     return String(base).replace(/[-_](?:sama|san)$/i, "").trim();
+}
+function normalizeRosterKey(value) {
+    if (typeof value !== "string") {
+        return "";
+    }
+    return value.trim().toLowerCase();
+}
+
+function sanitizeRosterTurnValue(value) {
+    if (!Number.isFinite(value)) {
+        return null;
+    }
+    const rounded = Math.floor(value);
+    if (!Number.isFinite(rounded)) {
+        return null;
+    }
+    return Math.max(0, rounded);
+}
+
+function toRosterTurnEntries(turns) {
+    if (!(turns instanceof Map)) {
+        return [];
+    }
+    const entries = [];
+    turns.forEach((value, key) => {
+        const normalized = normalizeRosterKey(key);
+        const turnsRemaining = sanitizeRosterTurnValue(value);
+        if (!normalized || turnsRemaining == null) {
+            return;
+        }
+        entries.push([normalized, turnsRemaining]);
+    });
+    return entries;
+}
+
+function fromRosterTurnEntries(entries) {
+    const map = new Map();
+    if (!Array.isArray(entries)) {
+        return map;
+    }
+    entries.forEach((entry) => {
+        if (!Array.isArray(entry) || entry.length < 2) {
+            return;
+        }
+        const normalized = normalizeRosterKey(entry[0]);
+        const turnsRemaining = sanitizeRosterTurnValue(entry[1]);
+        if (!normalized || turnsRemaining == null) {
+            return;
+        }
+        map.set(normalized, turnsRemaining);
+    });
+    return map;
+}
+
+function cloneRosterTurns(source) {
+    if (!(source instanceof Map)) {
+        return new Map();
+    }
+    return fromRosterTurnEntries(Array.from(source.entries()));
+}
+function toDisplayNameEntries(displayNames) {
+    if (!(displayNames instanceof Map)) {
+        return [];
+    }
+    return Array.from(displayNames.entries()).filter(([key]) => typeof key === "string" && key.trim().length);
+}
+function fromDisplayNameEntries(entries) {
+    if (!Array.isArray(entries)) {
+        return new Map();
+    }
+    const map = new Map();
+    entries.forEach(([key, value]) => {
+        const normalized = normalizeRosterKey(key);
+        if (!normalized) {
+            return;
+        }
+        map.set(normalized, typeof value === "string" && value.trim() ? value.trim() : key);
+    });
+    return map;
+}
+function toStatsEntries(stats) {
+    if (!(stats instanceof Map)) {
+        return [];
+    }
+    return Array.from(stats.entries()).filter(([key]) => typeof key === "string" && key.trim().length);
+}
+function fromStatsEntries(entries) {
+    if (!Array.isArray(entries)) {
+        return new Map();
+    }
+    return new Map(entries.filter(([key]) => typeof key === "string" && key.trim().length));
+}
+function cloneDecisionEvent(event) {
+    if (!event || typeof event !== "object") {
+        return null;
+    }
+    return {
+        ...event,
+        outfit: event.outfit ? { ...event.outfit } : null,
+    };
 }
 function getSettings() { return extension_settings[extensionName]; }
 function getActiveProfile() { const settings = getSettings(); return settings?.profiles?.[settings.activeProfile]; }
@@ -1403,7 +3370,8 @@ function buildOutfitMatchContext(options, normalizedName, profile) {
         context.text = options.buffer;
     }
 
-    const bufKey = typeof options?.bufKey === "string" ? options.bufKey : state.currentGenerationKey;
+    const rawKey = typeof options?.bufKey === "string" ? options.bufKey : state.currentGenerationKey;
+    const bufKey = rawKey ? (normalizeMessageKey(rawKey) || rawKey) : rawKey;
     let messageState = options?.messageState || null;
     if (!messageState && bufKey && state.perMessageStates instanceof Map) {
         messageState = state.perMessageStates.get(bufKey) || null;
@@ -1441,7 +3409,25 @@ function buildOutfitMatchContext(options, normalizedName, profile) {
 
 function resolveOutfitForMatch(rawName, options = {}) {
     const profile = options?.profile || getActiveProfile();
-    const normalizedName = normalizeCostumeName(rawName);
+    const rawInput = typeof options?.rawName === "string" && options.rawName.trim()
+        ? options.rawName.trim()
+        : rawName;
+    const baseToleranceSetting = options?.fuzzyTolerance ?? profile?.fuzzyTolerance ?? null;
+    const baseTranslate = Boolean(options?.translateFuzzyNames ?? profile?.translateFuzzyNames ?? profile?.translateNames ?? false);
+    const candidates = Array.isArray(profile?.mappings)
+        ? profile.mappings.map(entry => entry?.name).filter(Boolean)
+        : [];
+    const basePreprocessor = createNamePreprocessor({
+        candidates,
+        tolerance: resolveFuzzyTolerance(baseToleranceSetting),
+        translate: baseTranslate,
+    });
+    let resolution = options?.nameResolution || null;
+    if (!resolution) {
+        resolution = basePreprocessor(rawName, { priority: options?.priority ?? null });
+    }
+    let canonicalName = resolution?.canonical || rawName;
+    let normalizedName = normalizeCostumeName(canonicalName);
     const now = Number.isFinite(options?.now) ? options.now : Date.now();
 
     if (!normalizedName || !profile) {
@@ -1449,6 +3435,9 @@ function resolveOutfitForMatch(rawName, options = {}) {
             folder: String(options?.fallbackFolder || normalizedName || "").trim(),
             reason: profile ? "no-name" : "no-profile",
             normalizedName,
+            rawName: rawInput,
+            canonicalName,
+            nameResolution: resolution,
             resolvedAt: now,
             variant: null,
             trigger: null,
@@ -1457,18 +3446,46 @@ function resolveOutfitForMatch(rawName, options = {}) {
         };
     }
 
-    const mapping = findMappingForName(profile, normalizedName);
+    let mapping = findMappingForName(profile, normalizedName);
+    if (mapping && (mapping.fuzzyTolerance != null || mapping.translateFuzzyNames != null || mapping.translateNames != null)) {
+        const overrideToleranceSetting = mapping.fuzzyTolerance ?? baseToleranceSetting;
+        const overrideTranslate = mapping.translateFuzzyNames != null
+            ? Boolean(mapping.translateFuzzyNames)
+            : (mapping.translateNames != null ? Boolean(mapping.translateNames) : baseTranslate);
+        const overridePreprocessor = createNamePreprocessor({
+            candidates,
+            tolerance: resolveFuzzyTolerance(overrideToleranceSetting),
+            translate: overrideTranslate,
+        });
+        const remapped = overridePreprocessor(rawName, { priority: options?.priority ?? null });
+        if (remapped && remapped.canonical) {
+            canonicalName = remapped.canonical;
+            normalizedName = normalizeCostumeName(canonicalName);
+            resolution = {
+                ...remapped,
+                tolerance: resolveFuzzyTolerance(overrideToleranceSetting),
+                translateNames: overrideTranslate,
+            };
+            const remappedEntry = findMappingForName(profile, normalizedName);
+            if (remappedEntry) {
+                mapping = remappedEntry;
+            }
+        }
+    }
     const defaultFolder = String(options?.fallbackFolder || mapping?.defaultFolder || mapping?.folder || normalizedName).trim();
     const baseResult = {
         folder: defaultFolder || normalizedName,
         reason: "default-folder",
         normalizedName,
+        rawName: rawInput,
+        canonicalName,
         mapping,
         variant: null,
         trigger: null,
         awareness: { ok: true, reason: "no-awareness", reasons: [] },
         label: null,
         resolvedAt: now,
+        nameResolution: resolution,
     };
 
     if (!profile.enableOutfits || !mapping || !Array.isArray(mapping.outfits) || mapping.outfits.length === 0) {
@@ -1533,6 +3550,8 @@ function resolveOutfitForMatch(rawName, options = {}) {
             folder,
             reason: triggerResult.matched ? "trigger-match" : (awarenessResult.reason !== "no-awareness" ? "awareness-match" : "variant-default"),
             normalizedName,
+            rawName: rawInput,
+            canonicalName,
             mapping,
             variant,
             trigger: triggerResult.matched ? {
@@ -1544,6 +3563,7 @@ function resolveOutfitForMatch(rawName, options = {}) {
             awareness: awarenessResult,
             label,
             resolvedAt: now,
+            nameResolution: resolution,
         };
 
         matches.push({
@@ -1596,7 +3616,8 @@ function updateMessageOutfitRoster(normalizedKey, outfitInfo, opts, profile) {
         return;
     }
 
-    const bufKey = typeof opts?.bufKey === "string" ? opts.bufKey : state.currentGenerationKey;
+    const rawKey = typeof opts?.bufKey === "string" ? opts.bufKey : state.currentGenerationKey;
+    const bufKey = rawKey ? (normalizeMessageKey(rawKey) || rawKey) : rawKey;
     let msgState = opts?.messageState || null;
     if (!msgState && bufKey && state.perMessageStates instanceof Map) {
         msgState = state.perMessageStates.get(bufKey) || null;
@@ -1679,6 +3700,9 @@ function evaluateSwitchDecision(rawName, opts = {}, contextState = null, nowOver
     const now = Number.isFinite(nowOverride) ? nowOverride : Date.now();
     const decision = { now };
 
+    const suppliedRaw = typeof opts.rawName === "string" ? opts.rawName.trim() : "";
+    decision.rawName = suppliedRaw || rawName;
+    decision.nameResolution = opts.nameResolution || null;
     decision.name = normalizeCostumeName(rawName);
     const normalizedKey = decision.name.toLowerCase();
 
@@ -1698,6 +3722,8 @@ function evaluateSwitchDecision(rawName, opts = {}, contextState = null, nowOver
             context: opts.context,
             now,
             fallbackFolder: mappedFolder,
+            rawName: decision.rawName,
+            nameResolution: decision.nameResolution,
         });
         if (outfitResult && outfitResult.folder) {
             mappedFolder = outfitResult.folder;
@@ -1803,6 +3829,21 @@ async function issueCostumeForName(name, opts = {}) {
 
     if (!decision.shouldSwitch) {
         debugLog("Switch skipped for", name, "reason:", decision.reason || 'n/a');
+
+        if (decision.reason === 'outfit-unchanged' && decision.outfit?.folder && normalizedKey) {
+            const outfitCache = ensureCharacterOutfitCache(state);
+            outfitCache.set(normalizedKey, {
+                folder: decision.outfit.folder,
+                reason: decision.outfit.reason,
+                label: decision.outfit.label || null,
+                updatedAt: decision.now,
+            });
+        }
+
+        if (!shouldLogMatchEvent(opts.matchKind || null, decision.reason)) {
+            return;
+        }
+
         recordDecisionEvent({
             type: 'skipped',
             name: decision.name || name,
@@ -1890,6 +3931,149 @@ async function issueCostumeForName(name, opts = {}) {
 // ======================================================================
 // UI MANAGEMENT
 // ======================================================================
+const FUZZY_TOLERANCE_PRESETS = new Set(['off', 'auto', 'accent', 'always', 'low', 'custom']);
+const DEFAULT_FUZZY_TOLERANCE_PRESET = PROFILE_DEFAULTS.fuzzyTolerance || 'off';
+
+function interpretFuzzyToleranceSetting(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return { preset: 'custom', customValue: Math.max(0, Math.floor(value)) };
+    }
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        switch (normalized) {
+            case 'off':
+            case 'disabled':
+                return { preset: 'off', customValue: '' };
+            case 'auto':
+            case 'default':
+                return { preset: 'auto', customValue: '' };
+            case 'accent':
+            case 'accented':
+            case 'accent-only':
+                return { preset: 'accent', customValue: '' };
+            case 'always':
+            case 'on':
+                return { preset: 'always', customValue: '' };
+            case 'low':
+            case 'low-confidence':
+            case 'lowconfidence':
+                return { preset: 'low', customValue: '' };
+            case 'custom':
+                return { preset: 'custom', customValue: '' };
+            default:
+                return { preset: DEFAULT_FUZZY_TOLERANCE_PRESET, customValue: '' };
+        }
+    }
+    if (value && typeof value === 'object') {
+        const resolved = resolveFuzzyTolerance(value);
+        if (!resolved || !resolved.enabled) {
+            return { preset: 'off', customValue: '' };
+        }
+        const accentSensitive = resolved.accentSensitive !== false;
+        const threshold = Number.isFinite(resolved.lowConfidenceThreshold)
+            ? Math.max(0, Math.floor(resolved.lowConfidenceThreshold))
+            : null;
+        if (threshold == null) {
+            return accentSensitive
+                ? { preset: 'accent', customValue: '' }
+                : { preset: 'always', customValue: '' };
+        }
+        if (accentSensitive && threshold === 2) {
+            return { preset: 'auto', customValue: '' };
+        }
+        if (!accentSensitive && threshold === 2) {
+            return { preset: 'low', customValue: '' };
+        }
+        return { preset: 'custom', customValue: threshold };
+    }
+    if (value === true) {
+        return { preset: 'auto', customValue: '' };
+    }
+    return { preset: DEFAULT_FUZZY_TOLERANCE_PRESET, customValue: '' };
+}
+
+function sanitizeCustomFuzzyToleranceValue(rawValue) {
+    if (rawValue == null) {
+        return null;
+    }
+    const normalized = String(rawValue).trim();
+    if (!normalized) {
+        return null;
+    }
+    const parsed = Number(normalized);
+    if (!Number.isFinite(parsed)) {
+        return null;
+    }
+    return Math.max(0, Math.floor(parsed));
+}
+
+function updateFuzzyToleranceCustomVisibility(preset) {
+    const wrapper = document.getElementById('cs-fuzzy-tolerance-custom-wrapper');
+    if (!wrapper) {
+        return;
+    }
+    wrapper.hidden = preset !== 'custom';
+}
+
+function setFuzzyToleranceUI(value) {
+    const { preset, customValue } = interpretFuzzyToleranceSetting(value);
+    const select = document.querySelector('#cs-fuzzy-tolerance');
+    const normalizedPreset = FUZZY_TOLERANCE_PRESETS.has(preset)
+        ? preset
+        : DEFAULT_FUZZY_TOLERANCE_PRESET;
+    if (select) {
+        select.value = normalizedPreset;
+    }
+    const customField = document.querySelector('#cs-fuzzy-tolerance-custom');
+    if (customField) {
+        if (normalizedPreset === 'custom' && customValue !== '' && customValue != null) {
+            customField.value = customValue;
+        } else {
+            customField.value = '';
+        }
+        customField.removeAttribute('aria-invalid');
+    }
+    updateFuzzyToleranceCustomVisibility(select ? select.value : normalizedPreset);
+}
+
+function sanitizeFuzzyToleranceInputField(input) {
+    if (!input) {
+        return;
+    }
+    const sanitized = sanitizeCustomFuzzyToleranceValue(input.value);
+    if (sanitized == null) {
+        if (String(input.value || '').trim()) {
+            input.setAttribute('aria-invalid', 'true');
+        } else {
+            input.removeAttribute('aria-invalid');
+        }
+        return;
+    }
+    input.value = sanitized;
+    input.removeAttribute('aria-invalid');
+}
+
+function readFuzzyToleranceSettingFromUI() {
+    const select = document.querySelector('#cs-fuzzy-tolerance');
+    const preset = select?.value || DEFAULT_FUZZY_TOLERANCE_PRESET;
+    if (preset !== 'custom') {
+        return preset;
+    }
+    const customField = document.querySelector('#cs-fuzzy-tolerance-custom');
+    const sanitized = sanitizeCustomFuzzyToleranceValue(customField?.value);
+    if (sanitized == null) {
+        if (customField && String(customField.value || '').trim()) {
+            customField.setAttribute('aria-invalid', 'true');
+        }
+        return DEFAULT_FUZZY_TOLERANCE_PRESET;
+    }
+    if (customField) {
+        customField.value = sanitized;
+        customField.removeAttribute('aria-invalid');
+    }
+    return sanitized;
+}
+
 const uiMapping = {
     patterns: { selector: '#cs-patterns', type: 'patternEditor' },
     ignorePatterns: { selector: '#cs-ignore-patterns', type: 'textarea' },
@@ -1910,6 +4094,11 @@ const uiMapping = {
     detectPossessive: { selector: '#cs-detect-possessive', type: 'checkbox' },
     detectPronoun: { selector: '#cs-detect-pronoun', type: 'checkbox' },
     detectGeneral: { selector: '#cs-detect-general', type: 'checkbox' },
+    scanLowercaseFallbackTokens: { selector: '#cs-scan-lowercase-fallback', type: 'checkbox' },
+    fuzzyTolerance: { selector: '#cs-fuzzy-tolerance', type: 'fuzzyTolerance' },
+    fuzzyFallbackMaxScore: { selector: '#cs-fuzzy-fallback-max-score', type: 'optionalNumber' },
+    fuzzyFallbackCooldown: { selector: '#cs-fuzzy-fallback-cooldown', type: 'optionalNumber' },
+    translateFuzzyNames: { selector: '#cs-translate-fuzzy-names', type: 'checkbox' },
     attributionVerbs: { selector: '#cs-attribution-verbs', type: 'csvTextarea' },
     actionVerbs: { selector: '#cs-action-verbs', type: 'csvTextarea' },
     pronounVocabulary: { selector: '#cs-pronoun-vocabulary', type: 'csvTextarea' },
@@ -1926,6 +4115,135 @@ const uiMapping = {
     rosterPriorityDropoff: { selector: '#cs-roster-dropoff', type: 'number' },
     distancePenaltyWeight: { selector: '#cs-distance-penalty', type: 'number' },
 };
+
+function readScriptCollectionSelectionsFromUI() {
+    const selections = [];
+    SCRIPT_COLLECTION_KEYS.forEach((key) => {
+        const checkbox = document.querySelector(`[data-script-collection="${key}"]`);
+        if (checkbox && checkbox.checked) {
+            selections.push(key);
+        }
+    });
+    return selections;
+}
+
+function syncScriptCollectionControls(selected) {
+    const normalized = normalizeScriptCollections(selected, PROFILE_DEFAULTS.scriptCollections);
+    SCRIPT_COLLECTION_KEYS.forEach((key) => {
+        const checkbox = document.querySelector(`[data-script-collection="${key}"]`);
+        if (!checkbox) {
+            return;
+        }
+        checkbox.checked = normalized.includes(key);
+    });
+}
+
+function refreshProfilePreprocessorPipeline(profile = getActiveProfile()) {
+    if (!profile) {
+        return [];
+    }
+    const normalizedSelections = normalizeScriptCollections(profile.scriptCollections, PROFILE_DEFAULTS.scriptCollections);
+    profile.scriptCollections = normalizedSelections;
+    const pipeline = collectProfilePreprocessorScripts(profile);
+    if (!state.compiledRegexes || typeof state.compiledRegexes !== 'object') {
+        state.compiledRegexes = {};
+    }
+    state.compiledRegexes.preprocessorScripts = pipeline;
+    return pipeline;
+}
+
+function updateScenePanelSettingControls(panelSettings = ensureScenePanelSettings(getSettings?.() || {})) {
+    const settings = panelSettings || ensureScenePanelSettings(getSettings?.() || {});
+    const sections = settings?.sections || {};
+    $("#cs-scene-panel-enable").prop('checked', !!(settings && settings.enabled));
+    $("#cs-scene-auto-open").prop('checked', !!(settings && settings.autoOpenOnStream));
+    $("#cs-scene-auto-open-results").prop('checked', !!(settings && settings.autoOpenOnResults));
+    $("#cs-scene-auto-pin").prop('checked', settings.autoPinActive !== false);
+    $("#cs-scene-show-avatars").prop('checked', !!(settings && settings.showRosterAvatars));
+    $("#cs-scene-section-roster").prop('checked', sections.roster !== false);
+    $("#cs-scene-section-active").prop('checked', sections.activeCharacters !== false);
+    $("#cs-scene-section-log").prop('checked', sections.liveLog !== false);
+    $("#cs-scene-section-coverage").prop('checked', sections.coverage !== false);
+}
+
+function applyScenePanelEnabledSetting(enabled, { message } = {}) {
+    const settings = getSettings();
+    const panelSettings = ensureScenePanelSettings(settings);
+    panelSettings.enabled = Boolean(enabled);
+    updateScenePanelSettingControls(panelSettings);
+    requestScenePanelRender("panel-enabled", { immediate: true });
+    const fallbackMessage = panelSettings.enabled
+        ? "Scene panel enabled."
+        : "Scene panel hidden.";
+    persistSettings(message || fallbackMessage, "info");
+}
+
+function applyScenePanelSectionSetting(sectionKey, visible, { message } = {}) {
+    if (!sectionKey) {
+        return;
+    }
+    const settings = getSettings();
+    const panelSettings = ensureScenePanelSettings(settings);
+    if (typeof panelSettings.sections !== "object" || panelSettings.sections === null) {
+        panelSettings.sections = { ...DEFAULT_SCENE_PANEL_SECTIONS };
+    }
+    panelSettings.sections[sectionKey] = Boolean(visible);
+    updateScenePanelSettingControls(panelSettings);
+    requestScenePanelRender(`section-${sectionKey}`, { immediate: true });
+    const label = SCENE_PANEL_SECTION_LABELS[sectionKey] || sectionKey;
+    const fallbackMessage = panelSettings.sections[sectionKey]
+        ? `${label} section enabled.`
+        : `${label} section hidden.`;
+    persistSettings(message || fallbackMessage, "info");
+}
+
+function applyScenePanelAutoOpenOnStreamSetting(enabled, { message } = {}) {
+    const settings = getSettings();
+    const panelSettings = ensureScenePanelSettings(settings);
+    panelSettings.autoOpenOnStream = Boolean(enabled);
+    updateScenePanelSettingControls(panelSettings);
+    requestScenePanelRender("auto-open-stream", { immediate: true });
+    const fallbackMessage = panelSettings.autoOpenOnStream
+        ? "Scene panel auto-open enabled."
+        : "Scene panel auto-open disabled.";
+    persistSettings(message || fallbackMessage, "info");
+}
+
+function applyScenePanelAutoPinSetting(enabled, { message } = {}) {
+    const settings = getSettings();
+    const panelSettings = ensureScenePanelSettings(settings);
+    panelSettings.autoPinActive = Boolean(enabled);
+    updateScenePanelSettingControls(panelSettings);
+    requestScenePanelRender("auto-pin", { immediate: true });
+    const fallbackMessage = panelSettings.autoPinActive
+        ? "Auto-pin highlight enabled."
+        : "Auto-pin highlight disabled.";
+    persistSettings(message || fallbackMessage, "info");
+}
+
+function applyScenePanelShowAvatarsSetting(showAvatars, { message } = {}) {
+    const settings = getSettings();
+    const panelSettings = ensureScenePanelSettings(settings);
+    panelSettings.showRosterAvatars = Boolean(showAvatars);
+    updateScenePanelSettingControls(panelSettings);
+    requestScenePanelRender("avatar-toggle", { immediate: true });
+    const fallbackMessage = panelSettings.showRosterAvatars
+        ? "Roster avatars enabled."
+        : "Roster avatars hidden.";
+    persistSettings(message || fallbackMessage, "info");
+}
+
+function applyScenePanelAutoOpenResultsSetting(enabled, { message } = {}) {
+    const settings = getSettings();
+    const panelSettings = ensureScenePanelSettings(settings);
+    panelSettings.autoOpenOnResults = Boolean(enabled);
+    updateScenePanelSettingControls(panelSettings);
+    requestScenePanelRender("auto-open-results", { immediate: true });
+    const fallbackMessage = panelSettings.autoOpenOnResults
+        ? "Scene panel will auto-open on new results."
+        : "Scene panel will stay collapsed after new results.";
+    persistSettings(message || fallbackMessage, "info");
+}
 
 function normalizeProfileNameInput(name) {
     return String(name ?? '').replace(/\s+/g, ' ').trim();
@@ -1959,6 +4277,22 @@ function resolveMaxBufferChars(profile) {
 function resolveNumericSetting(value, fallback) {
     const num = Number(value);
     return Number.isFinite(num) ? num : fallback;
+}
+
+function resolveOptionalScoreLimit(value, fallback = null) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) {
+        return fallback;
+    }
+    return Math.min(1, Math.max(0, num));
+}
+
+function resolveFallbackCooldown(value, fallback = null) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) {
+        return fallback;
+    }
+    return Math.max(0, Math.floor(num));
 }
 
 function populateProfileDropdown() {
@@ -2275,13 +4609,18 @@ function updateFocusLockUI() {
 }
 
 function syncProfileFieldsToUI(profile, fields = []) {
+    const getValue = (key) => getProfileValueForUI(profile, key);
     if (!profile || !Array.isArray(fields)) return;
     fields.forEach((key) => {
         const mapping = uiMapping[key];
         if (!mapping) return;
+        if (mapping.type === 'fuzzyTolerance') {
+            setFuzzyToleranceUI(getValue(key));
+            return;
+        }
         const field = $(mapping.selector);
         if (!field.length) return;
-        const value = profile[key];
+        const value = getValue(key);
         switch (mapping.type) {
             case 'checkbox':
                 field.prop('checked', !!value);
@@ -2295,11 +4634,39 @@ function syncProfileFieldsToUI(profile, fields = []) {
             case 'patternEditor':
                 renderPatternEditor(profile);
                 break;
+            case 'optionalNumber':
+                field.val(value ?? '');
+                break;
             default:
                 field.val(value ?? '');
                 break;
         }
     });
+}
+
+function getProfileValueForUI(profile, key) {
+    if (!profile || typeof profile !== 'object') {
+        return PROFILE_DEFAULTS[key];
+    }
+    if (key === 'translateFuzzyNames') {
+        if (profile.translateFuzzyNames != null) {
+            return profile.translateFuzzyNames;
+        }
+        if (profile.translateNames != null) {
+            return profile.translateNames;
+        }
+        return PROFILE_DEFAULTS.translateFuzzyNames;
+    }
+    if (key === 'fuzzyTolerance') {
+        return profile.fuzzyTolerance ?? PROFILE_DEFAULTS.fuzzyTolerance;
+    }
+    if (key === 'fuzzyFallbackMaxScore') {
+        return resolveOptionalScoreLimit(profile?.fuzzyFallbackMaxScore, PROFILE_DEFAULTS.fuzzyFallbackMaxScore);
+    }
+    if (key === 'fuzzyFallbackCooldown') {
+        return resolveFallbackCooldown(profile?.fuzzyFallbackCooldown, PROFILE_DEFAULTS.fuzzyFallbackCooldown);
+    }
+    return profile[key];
 }
 
 function applyCommandProfileUpdates(profile, fields, { persist = false } = {}) {
@@ -2337,17 +4704,22 @@ function loadProfile(profileName) {
     }
     $("#cs-profile-name").val('').attr('placeholder', `Enter a name... (current: ${profileName})`);
     $("#cs-enable").prop('checked', !!settings.enabled);
+    const scenePanelSettings = ensureScenePanelSettings(settings);
+    updateScenePanelSettingControls(scenePanelSettings);
     for (const key in uiMapping) {
         const { selector, type } = uiMapping[key];
-        const value = profile[key] ?? PROFILE_DEFAULTS[key];
+        const value = getProfileValueForUI(profile, key);
         switch (type) {
             case 'checkbox': $(selector).prop('checked', !!value); break;
             case 'textarea': $(selector).val((value || []).join('\n')); break;
             case 'csvTextarea': $(selector).val((value || []).join(', ')); break;
             case 'patternEditor': renderPatternEditor(profile); break;
+            case 'fuzzyTolerance': setFuzzyToleranceUI(value); break;
+            case 'optionalNumber': $(selector).val(value ?? ''); break;
             default: $(selector).val(value); break;
         }
     }
+    syncScriptCollectionControls(profile.scriptCollections);
     $("#cs-detection-bias-value").text(profile.detectionBias || 0);
     renderMappings(profile);
     recompileRegexes();
@@ -2364,10 +4736,16 @@ function saveCurrentProfileData() {
         if (type === 'patternEditor') {
             continue;
         }
+        if (type === 'fuzzyTolerance') {
+            profileData[key] = readFuzzyToleranceSettingFromUI();
+            continue;
+        }
         const field = $(selector);
         if (!field.length) {
             const fallback = PROFILE_DEFAULTS[key];
-            if (type === 'textarea' || type === 'csvTextarea') {
+            if (type === 'optionalNumber') {
+                profileData[key] = fallback ?? null;
+            } else if (type === 'textarea' || type === 'csvTextarea') {
                 profileData[key] = Array.isArray(fallback) ? [...fallback] : [];
             } else if (type === 'checkbox') {
                 profileData[key] = Boolean(fallback);
@@ -2397,12 +4775,32 @@ function saveCurrentProfileData() {
                 value = Number.isFinite(parsed) ? parsed : fallback;
                 break;
             }
+            case 'optionalNumber': {
+                const raw = String(field.val() ?? '').trim();
+                if (!raw) {
+                    value = PROFILE_DEFAULTS[key] ?? null;
+                    break;
+                }
+                const parsed = Number(raw);
+                if (key === 'fuzzyFallbackMaxScore') {
+                    value = resolveOptionalScoreLimit(parsed, PROFILE_DEFAULTS[key] ?? null);
+                    break;
+                }
+                if (key === 'fuzzyFallbackCooldown') {
+                    value = resolveFallbackCooldown(parsed, PROFILE_DEFAULTS[key] ?? null);
+                    break;
+                }
+                value = Number.isFinite(parsed) ? parsed : (PROFILE_DEFAULTS[key] ?? null);
+                break;
+            }
             default:
                 value = String(field.val() ?? '').trim();
                 break;
         }
         profileData[key] = value;
     }
+    const scriptSelections = readScriptCollectionSelectionsFromUI();
+    profileData.scriptCollections = normalizeScriptCollections(scriptSelections, PROFILE_DEFAULTS.scriptCollections);
     const slotSource = Array.isArray(activeProfile?.patternSlots) ? activeProfile.patternSlots : [];
     const draftPatternIds = state?.draftPatternIds instanceof Set ? state.draftPatternIds : new Set();
     const preparedSlots = preparePatternSlotsForSave(slotSource, draftPatternIds);
@@ -2411,6 +4809,11 @@ function saveCurrentProfileData() {
     const mappingSource = Array.isArray(activeProfile?.mappings) ? activeProfile.mappings : [];
     const draftIds = state?.draftMappingIds instanceof Set ? state.draftMappingIds : new Set();
     profileData.mappings = prepareMappingsForSave(mappingSource, draftIds);
+    if (profileData.translateFuzzyNames == null) {
+        profileData.translateNames = PROFILE_DEFAULTS.translateNames;
+    } else {
+        profileData.translateNames = Boolean(profileData.translateFuzzyNames);
+    }
     return profileData;
 }
 
@@ -2565,6 +4968,10 @@ function commitProfileChanges({
     const normalized = normalizeProfile(saveCurrentProfileData(), PROFILE_DEFAULTS);
     const mappings = Array.isArray(normalized.mappings) ? normalized.mappings : [];
     mappings.forEach(ensureMappingCardId);
+    if (Array.isArray(normalized.patternSlots)) {
+        const existingSlots = Array.isArray(profile.patternSlots) ? profile.patternSlots : [];
+        normalized.patternSlots = reconcilePatternSlotReferences(existingSlots, normalized.patternSlots);
+    }
     Object.assign(profile, normalized);
     profile.mappings = mappings;
     if (recompile) {
@@ -2594,6 +5001,22 @@ function handleAutoSaveFieldEvent(event, key) {
         element: event.currentTarget,
         requiresRecompile: AUTO_SAVE_RECOMPILE_KEYS.has(key),
         requiresFocusLockRefresh: AUTO_SAVE_FOCUS_LOCK_KEYS.has(key),
+    });
+}
+
+function handleScriptCollectionCheckboxChange(event) {
+    const profile = getActiveProfile();
+    const selections = readScriptCollectionSelectionsFromUI();
+    const normalizedSelections = normalizeScriptCollections(selections, PROFILE_DEFAULTS.scriptCollections);
+    if (profile) {
+        profile.scriptCollections = normalizedSelections;
+    }
+    const pipeline = refreshProfilePreprocessorPipeline(profile);
+    refreshTesterPreprocessorPreview(pipeline);
+    scheduleProfileAutoSave({
+        key: 'scriptCollections',
+        element: event?.currentTarget,
+        requiresRecompile: true,
     });
 }
 
@@ -3746,6 +6169,39 @@ const RELEVANT_SKIP_CODES = new Set([
     'failed-trigger-cooldown',
 ]);
 
+const MAX_RECENT_DECISION_EVENTS = 25;
+
+function trimDecisionEvents(events, max = MAX_RECENT_DECISION_EVENTS) {
+    if (!Array.isArray(events)) {
+        return [];
+    }
+    if (events.length <= max) {
+        return events.slice();
+    }
+
+    const preservedTypes = new Set(["switch", "veto"]);
+    const queue = events.slice();
+    while (queue.length > max) {
+        const dropIndex = queue.findIndex((event) => {
+            if (!event || typeof event !== "object") {
+                return true;
+            }
+            return !preservedTypes.has(event.type);
+        });
+        if (dropIndex === -1) {
+            queue.splice(0, queue.length - max);
+        } else {
+            queue.splice(dropIndex, 1);
+        }
+    }
+    return queue;
+}
+
+const __testables = {
+    trimDecisionEvents,
+    recordDecisionEvent,
+};
+
 function recordLastVetoMatch(match, { source = 'live', persist = true } = {}) {
     const phrase = String(match ?? '').trim() || '(unknown veto phrase)';
     const entry = { phrase, source, at: Date.now() };
@@ -3802,6 +6258,45 @@ function updateSkipReasonSummaryDisplay(eventsOverride = null) {
     el.setAttribute('title', tooltip);
 }
 
+function overwriteRecentDecisionEvents(messageKey, events) {
+    const normalizedKey = normalizeMessageKey(messageKey);
+    const prepared = [];
+    if (normalizedKey && Array.isArray(events)) {
+        events.forEach((event) => {
+            const clone = cloneDecisionEvent(event);
+            if (!clone) {
+                return;
+            }
+            clone.messageKey = normalizedKey;
+            if (!Number.isFinite(clone.timestamp)) {
+                clone.timestamp = Date.now();
+            }
+            if (typeof clone.name === "string" && clone.name.trim()) {
+                clone.name = clone.name.trim();
+            }
+            const normalizedName = normalizeRosterKey(clone.normalized || clone.name);
+            if (normalizedName) {
+                clone.normalized = normalizedName;
+            } else {
+                delete clone.normalized;
+            }
+            prepared.push(clone);
+        });
+    }
+
+    const limited = trimDecisionEvents(prepared, MAX_RECENT_DECISION_EVENTS);
+
+    state.recentDecisionEvents = limited;
+
+    const session = ensureSessionData();
+    if (session) {
+        session.recentDecisionEvents = limited.map(event => cloneDecisionEvent(event));
+    }
+
+    updateSkipReasonSummaryDisplay();
+    return limited;
+}
+
 function recordDecisionEvent(event) {
     if (!event || typeof event !== 'object') {
         return;
@@ -3810,14 +6305,27 @@ function recordDecisionEvent(event) {
         ...event,
         timestamp: Number.isFinite(event.timestamp) ? event.timestamp : Date.now(),
     };
-    const maxEntries = 25;
+    if (typeof entry.name === "string" && entry.name.trim()) {
+        entry.name = entry.name.trim();
+    }
+    const normalizedName = normalizeRosterKey(entry.normalized || entry.name);
+    if (normalizedName) {
+        entry.normalized = normalizedName;
+    } else {
+        delete entry.normalized;
+    }
+    if (!entry.messageKey) {
+        if (typeof event.messageKey === "string" && event.messageKey.trim()) {
+            entry.messageKey = normalizeMessageKey(event.messageKey);
+        } else if (state.currentGenerationKey) {
+            entry.messageKey = normalizeMessageKey(state.currentGenerationKey);
+        }
+    }
     if (!Array.isArray(state.recentDecisionEvents)) {
         state.recentDecisionEvents = [];
     }
     state.recentDecisionEvents.push(entry);
-    if (state.recentDecisionEvents.length > maxEntries) {
-        state.recentDecisionEvents.splice(0, state.recentDecisionEvents.length - maxEntries);
-    }
+    state.recentDecisionEvents = trimDecisionEvents(state.recentDecisionEvents, MAX_RECENT_DECISION_EVENTS);
 
     const session = ensureSessionData();
     if (session) {
@@ -3825,12 +6333,11 @@ function recordDecisionEvent(event) {
             session.recentDecisionEvents = [];
         }
         session.recentDecisionEvents.push(entry);
-        if (session.recentDecisionEvents.length > maxEntries) {
-            session.recentDecisionEvents.splice(0, session.recentDecisionEvents.length - maxEntries);
-        }
+        session.recentDecisionEvents = trimDecisionEvents(session.recentDecisionEvents, MAX_RECENT_DECISION_EVENTS);
     }
 
     updateSkipReasonSummaryDisplay();
+    requestScenePanelRender("decision-event");
 }
 
 function updateTesterCopyButton() {
@@ -3858,6 +6365,53 @@ function updateTesterTopCharactersDisplay(entries) {
 
     el.textContent = entries.map(entry => entry.name).join(', ');
     el.classList.remove('cs-tester-list-placeholder');
+}
+
+function updateTesterPreprocessedDisplay(text) {
+    const el = $('#cs-test-preprocessed');
+    if (!el.length) {
+        return;
+    }
+    const placeholder = el.attr('data-placeholder') || 'No scripts applied yet.';
+    if (typeof text === 'string' && text.length > 0) {
+        el.removeClass('cs-tester-list-placeholder');
+        el.text(text);
+    } else {
+        el.addClass('cs-tester-list-placeholder');
+        el.text(placeholder);
+    }
+}
+
+function refreshTesterPreprocessorPreview(pipeline = null) {
+    const lastReport = state.lastTesterReport;
+    if (!lastReport || typeof lastReport.normalizedInput !== 'string' || !lastReport.normalizedInput.length) {
+        if (!lastReport) {
+            updateTesterPreprocessedDisplay(null);
+        }
+        return;
+    }
+
+    const profile = getActiveProfile();
+    if (!profile) {
+        updateTesterPreprocessedDisplay(null);
+        return;
+    }
+
+    const effectivePipeline = Array.isArray(pipeline)
+        ? pipeline
+        : refreshProfilePreprocessorPipeline(profile);
+    const normalizedInput = lastReport.normalizedInput;
+    const result = applyPreprocessorScripts(normalizedInput, effectivePipeline || []);
+    const processedText = typeof result?.text === 'string'
+        ? result.text
+        : normalizedInput;
+    state.lastPreprocessedText = processedText;
+    lastReport.preprocessedText = processedText;
+    const scriptSummary = normalizeAppliedScriptEntries(result?.applied);
+    state.lastPreprocessorScripts = scriptSummary;
+    lastReport.preprocessorScripts = clonePreprocessorScripts(scriptSummary);
+    updateTesterPreprocessedDisplay(processedText);
+    renderTesterPreprocessorMeta({ scripts: scriptSummary });
 }
 
 function renderTesterScoreBreakdown(details) {
@@ -3973,7 +6527,7 @@ function renderTesterRosterTimeline(events, warnings) {
                 warningContainer.append($('<div>').addClass('cs-roster-warning').text(message));
             });
         } else {
-            warningContainer.text('No TTL warnings triggered.');
+            warningContainer.text('No tester warnings triggered.');
         }
     }
 }
@@ -4032,6 +6586,18 @@ function analyzeCoverageDiagnostics(text, profile = getActiveProfile()) {
     };
 }
 
+function cloneCoverageDiagnostics(value) {
+    if (!value || typeof value !== "object") {
+        return { missingPronouns: [], missingAttributionVerbs: [], missingActionVerbs: [], totalTokens: 0 };
+    }
+    return {
+        missingPronouns: Array.isArray(value.missingPronouns) ? [...value.missingPronouns] : [],
+        missingAttributionVerbs: Array.isArray(value.missingAttributionVerbs) ? [...value.missingAttributionVerbs] : [],
+        missingActionVerbs: Array.isArray(value.missingActionVerbs) ? [...value.missingActionVerbs] : [],
+        totalTokens: Number.isFinite(value.totalTokens) ? value.totalTokens : 0,
+    };
+}
+
 function renderCoverageDiagnostics(result) {
     const data = result || { missingPronouns: [], missingAttributionVerbs: [], missingActionVerbs: [] };
     const update = (selector, values, type) => {
@@ -4071,6 +6637,186 @@ function refreshCoverageFromLastReport() {
     } else {
         renderCoverageDiagnostics(null);
     }
+}
+
+function describeScriptCollectionLabel(key) {
+    if (!key) {
+        return "Custom";
+    }
+    const normalized = String(key).toLowerCase();
+    return SCRIPT_COLLECTION_LABELS[normalized] || key;
+}
+
+function resolveScriptName(script, index = 0) {
+    if (!script || typeof script !== "object") {
+        return `Script ${index + 1}`;
+    }
+    const candidates = [script.name, script.label, script.title, script.id, script.scriptId];
+    for (const candidate of candidates) {
+        if (typeof candidate === "string" && candidate.trim()) {
+            return candidate.trim();
+        }
+    }
+    return `Script ${index + 1}`;
+}
+
+function resolveScriptDescription(script) {
+    if (!script || typeof script !== "object") {
+        return "";
+    }
+    const description = typeof script.description === "string"
+        ? script.description
+        : typeof script.desc === "string"
+            ? script.desc
+            : "";
+    return description.trim();
+}
+
+function normalizeAppliedScriptEntries(applied = []) {
+    if (!Array.isArray(applied)) {
+        return [];
+    }
+    return applied
+        .map((entry, index) => {
+            if (!entry || typeof entry !== "object") {
+                return null;
+            }
+            const script = entry.script && typeof entry.script === "object" ? entry.script : null;
+            return {
+                collection: typeof entry.collection === "string" ? entry.collection : null,
+                script: script
+                    ? {
+                        id: script.id ?? script.scriptId ?? null,
+                        name: resolveScriptName(script, index),
+                        description: resolveScriptDescription(script),
+                    }
+                    : null,
+            };
+        })
+        .filter(Boolean);
+}
+
+function clonePreprocessorScripts(scripts = []) {
+    if (!Array.isArray(scripts)) {
+        return [];
+    }
+    return scripts.map(entry => ({
+        collection: entry?.collection ?? null,
+        script: entry?.script
+            ? {
+                id: entry.script.id ?? null,
+                name: entry.script.name ?? null,
+                description: entry.script.description ?? "",
+            }
+            : null,
+    }));
+}
+
+function cloneFuzzyResolution(value) {
+    if (!value || typeof value !== "object") {
+        return null;
+    }
+    const tolerance = value.tolerance && typeof value.tolerance === "object"
+        ? { ...value.tolerance }
+        : null;
+    const fallbackMode = tolerance?.enabled
+        ? tolerance.accentSensitive
+            ? "auto"
+            : "always"
+        : "off";
+    return {
+        tolerance,
+        translateNames: Boolean(value.translateNames),
+        candidateCount: Number.isFinite(value.candidateCount) ? value.candidateCount : 0,
+        used: Boolean(value.used),
+        aliasCount: Number.isFinite(value.aliasCount) ? value.aliasCount : 0,
+        mode: typeof value.mode === "string" ? value.mode : fallbackMode,
+    };
+}
+
+function renderTesterScriptList(scriptsInput) {
+    const list = $("#cs-preprocessor-script-list");
+    if (!list.length) {
+        return;
+    }
+    const scripts = Array.isArray(scriptsInput) ? scriptsInput : [];
+    list.empty();
+    if (!scripts.length) {
+        list.append($('<li>').addClass('cs-tester-list-placeholder').text('No scripts executed.'));
+        return;
+    }
+    scripts.forEach((entry, index) => {
+        const item = $('<li>').addClass('cs-script-entry');
+        const summary = $('<div>').addClass('cs-script-entry__summary');
+        summary.append($('<span>').addClass('cs-script-entry__collection').text(describeScriptCollectionLabel(entry?.collection)));
+        const scriptName = entry?.script?.name || `Script ${index + 1}`;
+        summary.append($('<span>').addClass('cs-script-entry__name').text(scriptName));
+        const actions = $('<div>').addClass('cs-script-entry__actions');
+        const expandButton = $('<button type="button">')
+            .addClass('cs-script-entry__action cs-script-entry__expand')
+            .attr('aria-expanded', 'false')
+            .text('Show Details');
+        actions.append(expandButton);
+        const hasDescription = Boolean(entry?.script?.description);
+        const copyButton = $('<button type="button">')
+            .addClass('cs-script-entry__action cs-script-entry__copy')
+            .text('Copy')
+            .prop('disabled', !hasDescription);
+        if (hasDescription) {
+            copyButton.attr('title', 'Copy script description.');
+            copyButton.data('description', entry.script.description);
+        } else {
+            copyButton.attr('title', 'No description to copy.');
+        }
+        actions.append(copyButton);
+        summary.append(actions);
+        item.append(summary);
+        const description = $('<div>').addClass('cs-script-entry__description');
+        if (hasDescription) {
+            description.text(entry.script.description);
+        } else {
+            description.append($('<span>').addClass('cs-tester-list-placeholder').text('No description provided.'));
+        }
+        item.append(description);
+        list.append(item);
+    });
+}
+
+function renderTesterFuzzySummary(resolution) {
+    const pill = $("#cs-fuzzy-summary");
+    if (!pill.length) {
+        return;
+    }
+    const effective = resolution && typeof resolution === "object" ? resolution : null;
+    if (!effective || !effective.tolerance) {
+        pill.text('Fuzzy: Off');
+        pill.removeClass('is-active');
+        pill.attr('title', 'Fuzzy normalization disabled.');
+        return;
+    }
+    const modeLabel = effective.mode || (effective.tolerance.enabled ? (effective.tolerance.accentSensitive ? 'auto' : 'always') : 'off');
+    const aliasCount = Number.isFinite(effective.aliasCount) ? effective.aliasCount : 0;
+    const candidateCount = Number.isFinite(effective.candidateCount) ? effective.candidateCount : 0;
+    const summaryParts = [
+        `Mode: ${modeLabel}`,
+        `Translate names: ${effective.translateNames ? 'yes' : 'no'}`,
+        `Aliases loaded: ${aliasCount}`,
+        `Candidates tracked: ${candidateCount}`,
+        `Fuzzy used: ${effective.used ? 'yes' : 'no'}`,
+        `Accent sensitive: ${effective.tolerance.accentSensitive ? 'yes' : 'no'}`,
+        `Low-confidence threshold: ${effective.tolerance.lowConfidenceThreshold ?? 'n/a'}`,
+        `Max fuzzy score: ${effective.tolerance.maxScore ?? 'n/a'}`,
+    ];
+    pill.text(`Fuzzy ${modeLabel} • ${effective.used ? 'matched' : 'idle'} • Aliases ${aliasCount}`);
+    pill.attr('title', summaryParts.join('\n'));
+    pill.toggleClass('is-active', Boolean(effective.used));
+}
+
+function renderTesterPreprocessorMeta({ scripts, fuzzy } = {}) {
+    const scriptsToRender = scripts !== undefined ? scripts : state.lastPreprocessorScripts;
+    renderTesterScriptList(scriptsToRender);
+    const fuzzySummary = fuzzy !== undefined ? fuzzy : state.lastFuzzyResolution;
+    renderTesterFuzzySummary(fuzzySummary);
 }
 
 function mergeUniqueList(target = [], additions = []) {
@@ -4163,6 +6909,49 @@ function formatTesterReport(report) {
         ? report.profileSnapshot.patterns.map((entry) => String(entry ?? '').trim()).filter(Boolean)
         : [];
     lines.push(`Character Patterns: ${patternList.length ? patternList.join(', ') : '(none)'}`);
+    lines.push('');
+
+    const scriptSummary = Array.isArray(report.preprocessorScripts) ? report.preprocessorScripts : [];
+    lines.push('Preprocessor Scripts:');
+    if (scriptSummary.length) {
+        scriptSummary.forEach((entry, idx) => {
+            const label = describeScriptCollectionLabel(entry?.collection);
+            const scriptName = entry?.script?.name || '(unnamed script)';
+            lines.push(`  ${idx + 1}. [${label}] ${scriptName}`);
+            if (entry?.script?.description) {
+                entry.script.description.split(/\r?\n/).forEach(line => {
+                    lines.push(`       ${line}`);
+                });
+            }
+        });
+    } else {
+        lines.push('  (none executed)');
+    }
+    lines.push('');
+
+    const fuzzySummary = report.fuzzyResolution;
+    const toleranceInfo = fuzzySummary?.tolerance || null;
+    lines.push('Name Normalization:');
+    if (fuzzySummary) {
+        const fallbackMode = toleranceInfo?.enabled
+            ? toleranceInfo.accentSensitive
+                ? 'auto'
+                : 'always'
+            : 'off';
+        lines.push(`  Mode: ${fuzzySummary.mode || fallbackMode}`);
+        lines.push(`  Translate names: ${fuzzySummary.translateNames ? 'yes' : 'no'}`);
+        lines.push(`  Fuzzy used: ${fuzzySummary.used ? 'yes' : 'no'}`);
+        lines.push(`  Aliases loaded: ${fuzzySummary.aliasCount ?? 0}`);
+        lines.push(`  Candidates tracked: ${fuzzySummary.candidateCount ?? 0}`);
+        lines.push(`  Accent sensitive: ${toleranceInfo?.accentSensitive ? 'yes' : 'no'}`);
+        lines.push(`  Low-confidence threshold: ${toleranceInfo?.lowConfidenceThreshold ?? 'n/a'}`);
+        lines.push(`  Max fuzzy score: ${toleranceInfo?.maxScore ?? 'n/a'}`);
+    } else {
+        lines.push('  Mode: off');
+        lines.push('  Fuzzy used: no');
+        lines.push('  Aliases loaded: 0');
+        lines.push('  Candidates tracked: 0');
+    }
     lines.push('');
 
     const mergedDetections = mergeDetectionsForReport(report);
@@ -4428,6 +7217,7 @@ function adjustWindowForTrim(msgState, trimmedChars, combinedLength) {
 
     if (Number.isFinite(trimmedChars) && trimmedChars > 0) {
         msgState.bufferOffset += trimmedChars;
+        shiftDetectionContext(msgState, msgState.bufferOffset);
     }
 
     if (Number.isFinite(combinedLength) && combinedLength >= 0) {
@@ -4437,6 +7227,7 @@ function adjustWindowForTrim(msgState, trimmedChars, combinedLength) {
 }
 
 function createTesterMessageState(profile) {
+    const defaultRosterTTL = sanitizeRosterTurnValue(profile?.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL);
     return {
         lastAcceptedName: null,
         lastAcceptedTs: 0,
@@ -4446,12 +7237,14 @@ function createTesterMessageState(profile) {
         pendingSubject: null,
         pendingSubjectNormalized: null,
         sceneRoster: new Set(),
-        rosterTTL: profile.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL,
+        rosterTurns: new Map(),
+        defaultRosterTTL,
         outfitRoster: new Map(),
-        outfitTTL: profile.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL,
+        outfitTTL: sanitizeRosterTurnValue(profile?.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL),
         processedLength: 0,
         lastAcceptedIndex: -1,
         bufferOffset: 0,
+        detectionContext: createDetectionContext(0),
     };
 }
 
@@ -4477,7 +7270,10 @@ function buildSimulationFinalState(msgState) {
         lastSubject: msgState.lastSubject,
         processedLength: msgState.processedLength,
         sceneRoster: Array.from(msgState.sceneRoster || []),
-        rosterTTL: msgState.rosterTTL,
+        rosterTTL: msgState.defaultRosterTTL,
+        rosterTurns: msgState?.rosterTurns instanceof Map
+            ? Array.from(msgState.rosterTurns.entries())
+            : [],
         outfitRoster: Array.from(msgState.outfitRoster || []),
         outfitTTL: msgState.outfitTTL,
         vetoed: Boolean(msgState.vetoed),
@@ -4485,36 +7281,74 @@ function buildSimulationFinalState(msgState) {
     };
 }
 
-function simulateTesterStream(combined, profile, bufKey) {
+function simulateTesterStream(combined, profile, bufKey, options = {}) {
     const events = [];
-    const msgState = state.perMessageStates.get(bufKey);
+    const normalizedKey = normalizeMessageKey(bufKey) || bufKey;
+    const msgState = state.perMessageStates.get(normalizedKey);
+    state.lastPreprocessedText = typeof combined === "string" ? combined : "";
     if (!msgState) {
+        replaceLiveTesterOutputs([], { roster: [], preprocessedText: state.lastPreprocessedText });
+        requestScenePanelRender("tester-reset", { source: "tester" });
         return { events, finalState: null, rosterTimeline: [], rosterWarnings: [] };
     }
 
+    if (!(msgState.rosterTurns instanceof Map)) {
+        msgState.rosterTurns = new Map();
+    }
+    if (!Number.isFinite(msgState.defaultRosterTTL)) {
+        msgState.defaultRosterTTL = sanitizeRosterTurnValue(profile?.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL);
+    }
+
     const settings = getSettings();
+    const rosterDisplayNames = new Map();
+    const normalizedTesterKey = normalizeMessageKey(bufKey) || String(bufKey ?? "").trim() || "tester";
+    const testerMessageKey = normalizedTesterKey.startsWith("tester:")
+        ? normalizedTesterKey
+        : `tester:${normalizedTesterKey}`;
+    const overridePreprocessedText = typeof options?.preprocessedText === "string"
+        ? options.preprocessedText
+        : null;
+    const finalizeResult = (result, extra = {}) => {
+        const rosterSnapshot = Array.isArray(result?.finalState?.sceneRoster)
+            ? result.finalState.sceneRoster
+            : Array.from(msgState?.sceneRoster || []);
+        const eventList = Array.isArray(result?.events) ? result.events : events;
+        const preprocessedText = typeof extra.preprocessedText === "string"
+            ? extra.preprocessedText
+            : (overridePreprocessedText ?? state.lastPreprocessedText);
+        overwriteRecentDecisionEvents(testerMessageKey, eventList);
+        replaceLiveTesterOutputs(eventList, {
+            roster: rosterSnapshot,
+            displayNames: rosterDisplayNames,
+            preprocessedText,
+        });
+        state.lastPreprocessedText = preprocessedText;
+        requestScenePanelRender("tester-stream", { source: "tester" });
+        return result;
+    };
+
     const lockedName = String(settings?.focusLock?.character ?? "").trim();
     if (lockedName) {
         const event = buildFocusLockSkipEvent(lockedName);
         events.push(event);
-        return {
+        return finalizeResult({
             events,
             finalState: buildSimulationFinalState(msgState),
             rosterTimeline: [],
             rosterWarnings: [],
-        };
+        });
     }
 
     const effectivePatterns = Array.isArray(state.compiledRegexes?.effectivePatterns)
         ? state.compiledRegexes.effectivePatterns
         : [];
     if (!effectivePatterns.length) {
-        return {
+        return finalizeResult({
             events,
             finalState: null,
             rosterTimeline: [],
             rosterWarnings: [{ type: "no-patterns", message: NO_EFFECTIVE_PATTERNS_MESSAGE }],
-        };
+        });
     }
 
     const simulationState = {
@@ -4527,12 +7361,14 @@ function simulateTesterStream(combined, profile, bufKey) {
     };
 
     const maxBuffer = resolveMaxBufferChars(profile);
-    const rosterTTL = profile.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL;
+    const defaultRosterTTL = sanitizeRosterTurnValue(profile?.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL);
     const repeatSuppress = Number(profile.repeatSuppressMs) || 0;
-    let buffer = '';
+    let buffer = "";
     const rosterTimeline = [];
     const rosterWarnings = [];
-    const rosterDisplayNames = new Map();
+    let lastFuzzySnapshot = null;
+    let detectedAnyCandidates = false;
+
     for (let i = 0; i < combined.length; i++) {
         const appended = buffer + combined[i];
         buffer = appended.slice(-maxBuffer);
@@ -4571,32 +7407,61 @@ function simulateTesterStream(combined, profile, bufKey) {
             matchOptions.minIndex = minIndexRelative;
         }
 
-        const bestMatch = findBestMatch(buffer, null, matchOptions);
-        if (!bestMatch) continue;
+        const matches = findAllMatches(buffer, matchOptions);
+        if (Array.isArray(matches) && matches.length) {
+            detectedAnyCandidates = true;
+        }
+        if (matches?.fuzzyResolution) {
+            lastFuzzySnapshot = cloneFuzzyResolution(matches.fuzzyResolution);
+        }
+        const bestMatch = findBestMatch(buffer, matches, matchOptions);
+        if (!bestMatch) {
+            continue;
+        }
 
-        const absoluteIndex = Number.isFinite(bestMatch.matchIndex)
-            ? bufferOffset + bestMatch.matchIndex
+        const matchLength = Number.isFinite(bestMatch.matchLength) && bestMatch.matchLength > 0
+            ? Math.floor(bestMatch.matchLength)
+            : 1;
+        const matchTokenIndex = Number.isFinite(bestMatch.tokenIndex)
+            ? Math.floor(bestMatch.tokenIndex)
+            : null;
+        const matchTokenLength = Number.isFinite(bestMatch.tokenLength) && bestMatch.tokenLength > 0
+            ? Math.floor(bestMatch.tokenLength)
+            : null;
+        const matchKind = bestMatch.matchKind;
+        const matchEndRelative = Number.isFinite(bestMatch.matchIndex)
+            ? bestMatch.matchIndex + matchLength - 1
+            : null;
+        const absoluteIndex = Number.isFinite(matchEndRelative)
+            ? bufferOffset + matchEndRelative
             : newestAbsoluteIndex;
 
         msgState.lastAcceptedIndex = absoluteIndex;
         msgState.processedLength = Math.max(msgState.processedLength || 0, absoluteIndex + 1);
 
         if (profile.enableSceneRoster) {
-            const normalized = String(bestMatch.name || '').toLowerCase();
+            const normalized = normalizeRosterKey(bestMatch.name);
             const wasPresent = normalized ? msgState.sceneRoster.has(normalized) : false;
             if (normalized) {
                 msgState.sceneRoster.add(normalized);
-                rosterDisplayNames.set(normalized, bestMatch.name);
+                rosterDisplayNames.set(normalized, bestMatch.rawName || bestMatch.name);
+                const resolvedTTL = sanitizeRosterTurnValue(msgState.defaultRosterTTL ?? defaultRosterTTL);
+                if (resolvedTTL != null) {
+                    msgState.rosterTurns.set(normalized, resolvedTTL);
+                }
             }
-            msgState.rosterTTL = rosterTTL;
-            msgState.outfitTTL = rosterTTL;
+            msgState.outfitTTL = sanitizeRosterTurnValue(profile?.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL);
             rosterTimeline.push({
                 type: wasPresent ? 'refresh' : 'join',
                 name: bestMatch.name,
+                rawName: bestMatch.rawName || bestMatch.name,
                 matchKind: bestMatch.matchKind,
                 charIndex: absoluteIndex,
+                tokenIndex: matchTokenIndex,
+                tokenLength: matchTokenLength,
                 timestamp: absoluteIndex * 50,
                 rosterSize: msgState.sceneRoster.size,
+                nameResolution: bestMatch.nameResolution || null,
             });
         }
 
@@ -4605,9 +7470,21 @@ function simulateTesterStream(combined, profile, bufKey) {
         }
 
         const virtualNow = absoluteIndex * 50;
-        if (msgState.lastAcceptedName?.toLowerCase() === bestMatch.name.toLowerCase() &&
-            (virtualNow - msgState.lastAcceptedTs < repeatSuppress)) {
-            events.push({ type: 'skipped', name: bestMatch.name, matchKind: bestMatch.matchKind, reason: 'repeat-suppression', charIndex: absoluteIndex });
+        if (msgState.lastAcceptedName?.toLowerCase() === bestMatch.name.toLowerCase()
+            && (virtualNow - msgState.lastAcceptedTs < repeatSuppress)) {
+            if (bestMatch.matchKind !== 'pronoun') {
+                events.push({
+                    type: 'skipped',
+                    name: bestMatch.name,
+                    rawName: bestMatch.rawName || bestMatch.name,
+                    matchKind: bestMatch.matchKind,
+                    reason: 'repeat-suppression',
+                    charIndex: absoluteIndex,
+                    tokenIndex: matchTokenIndex,
+                    tokenLength: matchTokenLength,
+                    nameResolution: bestMatch.nameResolution || null,
+                });
+            }
             continue;
         }
 
@@ -4619,15 +7496,20 @@ function simulateTesterStream(combined, profile, bufKey) {
             bufKey,
             messageState: msgState,
             context: { text: buffer, matchKind: bestMatch.matchKind, roster: msgState.sceneRoster },
+            rawName: bestMatch.rawName || bestMatch.name,
+            nameResolution: bestMatch.nameResolution || null,
         }, simulationState, virtualNow);
         if (decision.shouldSwitch) {
             events.push({
                 type: 'switch',
                 name: bestMatch.name,
+                rawName: bestMatch.rawName || bestMatch.name,
                 folder: decision.folder,
                 matchKind: bestMatch.matchKind,
                 score: Math.round(bestMatch.score ?? 0),
                 charIndex: absoluteIndex,
+                tokenIndex: matchTokenIndex,
+                tokenLength: matchTokenLength,
                 outfit: decision.outfit ? {
                     folder: decision.outfit.folder,
                     label: decision.outfit.label || null,
@@ -4635,6 +7517,7 @@ function simulateTesterStream(combined, profile, bufKey) {
                     trigger: decision.outfit.trigger || null,
                     awareness: decision.outfit.awareness || null,
                 } : null,
+                nameResolution: bestMatch.nameResolution || null,
             });
             simulationState.lastIssuedCostume = decision.name;
             simulationState.lastIssuedFolder = decision.folder;
@@ -4648,35 +7531,107 @@ function simulateTesterStream(combined, profile, bufKey) {
                 updatedAt: decision.now,
             });
         } else {
-            events.push({
-                type: 'skipped',
-                name: bestMatch.name,
-                matchKind: bestMatch.matchKind,
-                reason: decision.reason || 'unknown',
-                outfit: decision.outfit ? {
+            if (decision.reason === 'outfit-unchanged' && decision.outfit?.folder) {
+                const cache = ensureCharacterOutfitCache(simulationState);
+                cache.set(decision.name.toLowerCase(), {
                     folder: decision.outfit.folder,
+                    reason: decision.outfit.reason || 'tester',
                     label: decision.outfit.label || null,
-                    reason: decision.outfit.reason || null,
-                    trigger: decision.outfit.trigger || null,
-                    awareness: decision.outfit.awareness || null,
-                } : null,
-                charIndex: absoluteIndex,
+                    updatedAt: decision.now,
+                });
+            }
+
+            if (shouldLogMatchEvent(bestMatch.matchKind, decision.reason)) {
+                events.push({
+                    type: 'skipped',
+                    name: bestMatch.name,
+                    rawName: bestMatch.rawName || bestMatch.name,
+                    matchKind: bestMatch.matchKind,
+                    reason: decision.reason || 'unknown',
+                    outfit: decision.outfit ? {
+                        folder: decision.outfit.folder,
+                        label: decision.outfit.label || null,
+                        reason: decision.outfit.reason || null,
+                        trigger: decision.outfit.trigger || null,
+                        awareness: decision.outfit.awareness || null,
+                    } : null,
+                    charIndex: absoluteIndex,
+                    tokenIndex: matchTokenIndex,
+                    tokenLength: matchTokenLength,
+                    nameResolution: bestMatch.nameResolution || null,
+                });
+            }
+        }
+
+        if (state.currentGenerationKey && state.currentGenerationKey === bufKey) {
+            const displayNames = new Map();
+            if (bestMatch.name) {
+                const normalizedName = normalizeRosterKey(bestMatch.name);
+                if (normalizedName) {
+                    displayNames.set(normalizedName, bestMatch.rawName || bestMatch.name);
+                }
+            }
+            applySceneRosterUpdate({
+                key: bufKey,
+                messageId: extractMessageIdFromKey(bufKey),
+                roster: Array.from(msgState.sceneRoster || []),
+                displayNames,
+                lastMatch: {
+                    name: bestMatch.name,
+                    rawName: bestMatch.rawName || bestMatch.name,
+                    matchKind,
+                    charIndex: absoluteIndex,
+                    tokenIndex: matchTokenIndex,
+                    tokenLength: matchTokenLength,
+                    nameResolution: bestMatch.nameResolution || null,
+                },
+                updatedAt: now,
+                turnsByMember: cloneRosterTurns(msgState.rosterTurns),
+                turnsRemaining: msgState.defaultRosterTTL,
             });
+            requestScenePanelRender("stream-roster");
         }
     }
 
     const finalState = buildSimulationFinalState(msgState);
+    const fuzzySnapshot = lastFuzzySnapshot || cloneFuzzyResolution(state.lastFuzzyResolution);
+    const fuzzyToleranceEnabled = Boolean(fuzzySnapshot?.tolerance?.enabled);
+    const fuzzyCandidates = Number.isFinite(fuzzySnapshot?.candidateCount) ? fuzzySnapshot.candidateCount : 0;
+    const hasInputText = typeof combined === "string" ? Boolean(combined.trim()) : false;
 
-    if (profile.enableSceneRoster && msgState.sceneRoster.size > 0) {
-        const turnsRemaining = (msgState.rosterTTL ?? rosterTTL) - 1;
-        if (turnsRemaining <= 0) {
-            const names = Array.from(msgState.sceneRoster || []).map((name) => rosterDisplayNames.get(name) || name);
+    if (hasInputText && fuzzyToleranceEnabled && !fuzzySnapshot?.used && !detectedAnyCandidates && fuzzyCandidates > 0) {
+        rosterWarnings.push({
+            type: "fuzzy-idle",
+            message: "Fuzzy tolerance is enabled, but no names were normalized. Turn on Detect General Name Mentions or confirm Detect Attribution and Detect Action are enabled so fuzzy matching has candidates.",
+        });
+    }
+
+    if (profile.enableSceneRoster && msgState.rosterTurns instanceof Map && msgState.rosterTurns.size > 0) {
+        const expiring = [];
+        msgState.rosterTurns.forEach((turns, normalized) => {
+            const sanitized = sanitizeRosterTurnValue(turns);
+            if (sanitized == null) {
+                return;
+            }
+            if (sanitized <= 1) {
+                const nextRemaining = Math.max(0, sanitized - 1);
+                expiring.push({
+                    name: rosterDisplayNames.get(normalized) || normalized,
+                    remaining: nextRemaining,
+                });
+            }
+        });
+        if (expiring.length) {
+            const names = expiring.map((entry) => entry.name);
+            const turnsRemaining = expiring.reduce((min, entry) => Math.min(min, entry.remaining), expiring[0].remaining);
+            const ttlLabel = defaultRosterTTL != null
+                ? `Scene roster TTL of ${defaultRosterTTL}`
+                : "Scene roster TTL";
             rosterWarnings.push({
                 type: 'ttl-expiry',
                 turnsRemaining: Math.max(0, turnsRemaining),
                 names,
-                message: `Scene roster TTL of ${rosterTTL} will clear ${names.join(', ')} before the next message. Consider increas` +
-                    'ing the TTL for longer conversations.',
+                message: `${ttlLabel} will clear ${names.join(', ')} before the next message. Consider increasing the TTL for longer conversations.`,
             });
             rosterTimeline.push({
                 type: 'expiry-warning',
@@ -4687,8 +7642,11 @@ function simulateTesterStream(combined, profile, bufKey) {
         }
     }
 
-    return { events, finalState, rosterTimeline, rosterWarnings };
+    return finalizeResult({ events, finalState, rosterTimeline, rosterWarnings }, {
+        preprocessedText: overridePreprocessedText ?? state.lastPreprocessedText,
+    });
 }
+
 
 function renderTesterStream(eventList, events) {
     eventList.empty();
@@ -4698,10 +7656,25 @@ function renderTesterStream(eventList, events) {
     }
 
     let delay = 0;
+    const formatTokenSpan = (event) => {
+        if (!event || !Number.isFinite(event.tokenIndex)) {
+            return "";
+        }
+        const start = event.tokenIndex + 1;
+        const length = Number.isFinite(event.tokenLength) && event.tokenLength > 1
+            ? Math.floor(event.tokenLength)
+            : null;
+        if (length && length > 1) {
+            const end = start + length - 1;
+            return `, token T#${start}…${end}`;
+        }
+        return `, token T#${start}`;
+    };
     events.forEach(event => {
         const item = $('<li>');
         if (event.type === 'switch') {
-            const details = `${event.name}${event.matchKind ? ' via ' + event.matchKind : ''}, char #${event.charIndex + 1}${Number.isFinite(event.score) ? ', score ' + event.score : ''}`;
+            const tokenSummary = formatTokenSpan(event);
+            const details = `${event.name}${event.matchKind ? ' via ' + event.matchKind : ''}, char #${event.charIndex + 1}${tokenSummary}${Number.isFinite(event.score) ? ', score ' + event.score : ''}`;
             const outfitInfo = summarizeOutfitDecision(event.outfit);
             const extra = outfitInfo ? `<br><span class="cs-tester-outfit-detail">${escapeHtml(outfitInfo)}</span>` : '';
             item.addClass('cs-tester-log-switch').html(`<b>Switch → ${escapeHtml(event.folder)}</b><small> (${escapeHtml(details)})${extra}</small>`);
@@ -4711,7 +7684,8 @@ function renderTesterStream(eventList, events) {
             const skipDetails = `${event.matchKind}, ${describeSkipReason(event.reason)}`;
             const outfitInfo = summarizeOutfitDecision(event.outfit);
             const extra = outfitInfo ? `<br><span class="cs-tester-outfit-detail">${escapeHtml(outfitInfo)}</span>` : '';
-            item.addClass('cs-tester-log-skip').html(`<span>${escapeHtml(event.name)}</span><small> (${escapeHtml(skipDetails)})${extra}</small>`);
+            const tokenSummary = formatTokenSpan(event);
+            item.addClass('cs-tester-log-skip').html(`<span>${escapeHtml(event.name)}</span><small> (${escapeHtml(skipDetails)}${tokenSummary})${extra}</small>`);
         }
 
         const timer = setTimeout(() => {
@@ -4733,15 +7707,22 @@ function testRegexPattern() {
     state.lastTesterReport = null;
     updateTesterCopyButton();
     updateTesterTopCharactersDisplay(null);
+    updateTesterPreprocessedDisplay(null);
+    state.lastPreprocessorScripts = [];
+    state.lastFuzzyResolution = null;
+    renderTesterPreprocessorMeta({ scripts: [], fuzzy: null });
     $("#cs-test-veto-result").text('N/A').css('color', 'var(--text-color-soft)');
     renderTesterScoreBreakdown(null);
     renderTesterRosterTimeline(null, null);
     renderCoverageDiagnostics(null);
+    clearLiveTesterOutputs();
+    requestScenePanelRender("tester-reset", { immediate: true, source: "tester" });
     const text = $("#cs-regex-test-input").val();
     if (!text) {
         $("#cs-test-all-detections, #cs-test-winner-list").html('<li class="cs-tester-list-placeholder">Enter text to test.</li>');
         updateTesterTopCharactersDisplay(null);
         updateSkipReasonSummaryDisplay([]);
+        updateTesterPreprocessedDisplay(null);
         return;
     }
 
@@ -4789,34 +7770,77 @@ function testRegexPattern() {
         $("#cs-test-veto-result").html(`Vetoed by: <b style="color: var(--red);">${vetoMatch}</b>`);
         allDetectionsList.html('<li class="cs-tester-list-placeholder">Message vetoed.</li>');
         const vetoEvents = [{ type: 'veto', match: vetoMatch, charIndex: combined.length - 1 }];
+        state.lastPreprocessedText = combined;
+        updateTesterPreprocessedDisplay(combined);
         renderTesterStream(streamList, vetoEvents);
         updateSkipReasonSummaryDisplay(vetoEvents);
         renderTesterScoreBreakdown([]);
         renderTesterRosterTimeline([], []);
         renderCoverageDiagnostics(coverage);
+        replaceLiveTesterOutputs(vetoEvents, { roster: [], preprocessedText: state.lastPreprocessedText });
+        requestScenePanelRender("tester-veto", { source: "tester" });
         const skipSummary = summarizeSkipReasonsForReport(vetoEvents);
-        state.lastTesterReport = { ...reportBase, vetoed: true, vetoMatch, events: vetoEvents, matches: [], topCharacters: [], rosterTimeline: [], rosterWarnings: [], scoreDetails: [], coverage, skipSummary };
+        state.lastTesterReport = {
+            ...reportBase,
+            vetoed: true,
+            vetoMatch,
+            events: vetoEvents,
+            matches: [],
+            topCharacters: [],
+            rosterTimeline: [],
+            rosterWarnings: [],
+            scoreDetails: [],
+            coverage,
+            skipSummary,
+            preprocessedText: state.lastPreprocessedText,
+            preprocessorScripts: clonePreprocessorScripts(state.lastPreprocessorScripts),
+            fuzzyResolution: cloneFuzzyResolution(state.lastFuzzyResolution),
+        };
         updateTesterTopCharactersDisplay([]);
         updateTesterCopyButton();
     } else {
         $("#cs-test-veto-result").text('No veto phrases matched.').css('color', 'var(--green)');
 
         const allMatches = findAllMatches(combined).sort((a, b) => a.matchIndex - b.matchIndex);
+        const preprocessedSnapshot = typeof state.lastPreprocessedText === "string"
+            ? state.lastPreprocessedText
+            : combined;
+        const scriptSnapshot = clonePreprocessorScripts(state.lastPreprocessorScripts);
+        const fuzzySnapshot = cloneFuzzyResolution(state.lastFuzzyResolution);
+        renderTesterPreprocessorMeta({ scripts: scriptSnapshot, fuzzy: fuzzySnapshot });
+        updateTesterPreprocessedDisplay(preprocessedSnapshot);
         allDetectionsList.empty();
         if (allMatches.length > 0) {
             allMatches.forEach(m => {
                 const charPos = Number.isFinite(m.matchIndex) ? m.matchIndex + 1 : '?';
-                allDetectionsList.append(`<li><b>${m.name}</b> <small>(${m.matchKind} @ ${charPos}, p:${m.priority})</small></li>`);
+                const priorityLabel = Number.isFinite(m.priority) ? m.priority : 'n/a';
+                let resolutionNote = '';
+                if (m.nameResolution?.changed) {
+                    const rawSource = m.nameResolution.raw || m.rawName || m.originalName || m.name;
+                    const methodLabel = m.nameResolution.method === 'fuzzy'
+                        ? m.nameResolution.score != null
+                            ? `fuzzy:${m.nameResolution.score.toFixed(2)}`
+                            : 'fuzzy'
+                        : m.nameResolution.method || 'normalized';
+                    const safeRaw = typeof rawSource === 'string' && rawSource.trim()
+                        ? rawSource.trim()
+                        : 'unknown';
+                    resolutionNote = ` <span class="cs-detection-note">→ normalized from ‘${escapeHtml(safeRaw)}’ via ${escapeHtml(methodLabel)}</span>`;
+                }
+                allDetectionsList.append(`<li><b>${escapeHtml(m.name)}</b> <small>(${escapeHtml(m.matchKind)} @ ${charPos}, p:${priorityLabel})</small>${resolutionNote}</li>`);
             });
         } else {
             allDetectionsList.html('<li class="cs-tester-list-placeholder">No detections found.</li>');
         }
 
         resetTesterMessageState();
-        const simulationResult = simulateTesterStream(combined, tempProfile, bufKey);
+        const simulationResult = simulateTesterStream(combined, tempProfile, bufKey, {
+            preprocessedText: preprocessedSnapshot,
+        });
         const events = Array.isArray(simulationResult?.events) ? simulationResult.events : [];
         renderTesterStream(streamList, events);
         updateSkipReasonSummaryDisplay(events);
+        updateTesterPreprocessedDisplay(preprocessedSnapshot);
         const testerRoster = simulationResult?.finalState?.sceneRoster || [];
         const topCharacters = rankSceneCharacters(allMatches, {
             rosterSet: testerRoster,
@@ -4824,6 +7848,7 @@ function testRegexPattern() {
             distancePenaltyWeight: resolveNumericSetting(tempProfile?.distancePenaltyWeight, PROFILE_DEFAULTS.distancePenaltyWeight),
             rosterBonus: resolveNumericSetting(tempProfile?.rosterBonus, PROFILE_DEFAULTS.rosterBonus),
             priorityMultiplier: 100,
+            tokenLength: Number.isFinite(allMatches?.tokenCount) ? allMatches.tokenCount : null,
         });
         const detailedScores = scoreMatchesDetailed(allMatches, combined.length, {
             rosterSet: testerRoster,
@@ -4832,11 +7857,16 @@ function testRegexPattern() {
             rosterBonus: resolveNumericSetting(tempProfile?.rosterBonus, PROFILE_DEFAULTS.rosterBonus),
             rosterPriorityDropoff: resolveNumericSetting(tempProfile?.rosterPriorityDropoff, PROFILE_DEFAULTS.rosterPriorityDropoff),
             priorityMultiplier: 100,
+            tokenLength: Number.isFinite(allMatches?.tokenCount) ? allMatches.tokenCount : null,
         });
         renderTesterScoreBreakdown(detailedScores);
         renderTesterRosterTimeline(simulationResult?.rosterTimeline || [], simulationResult?.rosterWarnings || []);
         renderCoverageDiagnostics(coverage);
         updateTesterTopCharactersDisplay(topCharacters);
+        state.lastPreprocessedText = preprocessedSnapshot;
+        state.lastPreprocessorScripts = clonePreprocessorScripts(scriptSnapshot);
+        state.lastFuzzyResolution = cloneFuzzyResolution(fuzzySnapshot);
+
         state.lastTesterReport = {
             ...reportBase,
             vetoed: false,
@@ -4864,6 +7894,9 @@ function testRegexPattern() {
             rosterWarnings: Array.isArray(simulationResult?.rosterWarnings) ? simulationResult.rosterWarnings.map(warn => ({ ...warn })) : [],
             scoreDetails: detailedScores.map(detail => ({ ...detail })),
             coverage,
+            preprocessedText: preprocessedSnapshot,
+            preprocessorScripts: clonePreprocessorScripts(scriptSnapshot),
+            fuzzyResolution: cloneFuzzyResolution(fuzzySnapshot),
         };
         updateTesterCopyButton();
     }
@@ -4878,6 +7911,8 @@ function testRegexPattern() {
 
 function wireUI() {
     const settings = getSettings();
+    const panelSettings = ensureScenePanelSettings(settings);
+    updateScenePanelSettingControls(panelSettings);
     initTabNavigation();
     Object.entries(uiMapping).forEach(([key, mapping]) => {
         const selector = mapping?.selector;
@@ -4885,15 +7920,47 @@ function wireUI() {
             return;
         }
         $(document).on('change', selector, (event) => handleAutoSaveFieldEvent(event, key));
-        if (['text', 'textarea', 'csvTextarea', 'number', 'range'].includes(mapping.type)) {
+        if (['text', 'textarea', 'csvTextarea', 'number', 'range', 'optionalNumber'].includes(mapping.type)) {
             $(document).on('input', selector, (event) => handleAutoSaveFieldEvent(event, key));
         }
     });
+    $(document).on('change', '#cs-fuzzy-tolerance', function() {
+        updateFuzzyToleranceCustomVisibility($(this).val());
+    });
+    const fuzzyToleranceCustomHandler = function(event) {
+        sanitizeFuzzyToleranceInputField(event.currentTarget);
+        handleAutoSaveFieldEvent(event, 'fuzzyTolerance');
+    };
+    $(document).on('input', '#cs-fuzzy-tolerance-custom', fuzzyToleranceCustomHandler);
+    $(document).on('change', '#cs-fuzzy-tolerance-custom', fuzzyToleranceCustomHandler);
+    $(document).on('change', '.cs-script-collection-toggle', handleScriptCollectionCheckboxChange);
     $(document).on('focusin mouseenter', '[data-change-notice]', function() {
         if (this?.disabled) {
             return;
         }
         announceAutoSaveIntent(this, null, this.dataset.changeNotice, this.dataset.changeNoticeKey);
+    });
+    $(document).on('click', '.cs-script-entry__expand', function() {
+        const item = $(this).closest('.cs-script-entry');
+        if (!item.length) {
+            return;
+        }
+        const expanded = !item.hasClass('is-expanded');
+        item.toggleClass('is-expanded', expanded);
+        $(this).attr('aria-expanded', expanded ? 'true' : 'false');
+        $(this).text(expanded ? 'Hide Details' : 'Show Details');
+    });
+    $(document).on('click', '.cs-script-entry__copy', function() {
+        if (this?.disabled) {
+            return;
+        }
+        const description = $(this).data('description');
+        if (!description) {
+            return;
+        }
+        copyTextToClipboard(description)
+            .then(() => showStatus('Script description copied.', 'success'))
+            .catch(() => showStatus('Unable to copy script description.', 'error'));
     });
 
     $(document).on('input', '#cs-pattern-search', function() {
@@ -4917,6 +7984,190 @@ function wireUI() {
         announceAutoSaveIntent(this, null, `Extension will ${enabled ? 'enable' : 'disable'} immediately.`, 'cs-enable');
         settings.enabled = enabled;
         persistSettings('Extension ' + (enabled ? 'Enabled' : 'Disabled'), 'info');
+    });
+    $(document).on('change', '#cs-scene-panel-enable', function() {
+        const enabled = $(this).prop('checked');
+        const notice = this?.dataset?.changeNotice
+            || `Scene panel will ${enabled ? 'appear next to chat.' : 'hide until re-enabled.'}`;
+        announceAutoSaveIntent(this, null, notice, 'cs-scene-panel-enable');
+        applyScenePanelEnabledSetting(enabled, {
+            message: enabled ? 'Scene panel enabled.' : 'Scene panel hidden.',
+        });
+    });
+    $(document).on('change', '#cs-scene-auto-open', function() {
+        const autoOpen = $(this).prop('checked');
+        const notice = this?.dataset?.changeNotice
+            || `Scene panel will ${autoOpen ? 'auto-open' : 'remain collapsed'} when streaming starts.`;
+        announceAutoSaveIntent(this, null, notice, 'cs-scene-auto-open');
+        applyScenePanelAutoOpenOnStreamSetting(autoOpen, {
+            message: autoOpen
+                ? 'Scene panel auto-open enabled.'
+                : 'Scene panel auto-open disabled.',
+        });
+    });
+    $(document).on('change', '#cs-scene-auto-open-results', function() {
+        const autoOpen = $(this).prop('checked');
+        const notice = this?.dataset?.changeNotice
+            || `Scene panel will ${autoOpen ? 'pop open' : 'stay collapsed'} when new results are captured.`;
+        announceAutoSaveIntent(this, null, notice, 'cs-scene-auto-open-results');
+        applyScenePanelAutoOpenResultsSetting(autoOpen, {
+            message: autoOpen
+                ? 'Scene panel will auto-open on new results.'
+                : 'Scene panel will stay collapsed after new results.',
+        });
+    });
+    $(document).on('change', '#cs-scene-section-roster', function() {
+        const visible = $(this).prop('checked');
+        const notice = this?.dataset?.changeNotice
+            || `Scene roster section will ${visible ? 'be shown' : 'be hidden'} in the panel.`;
+        announceAutoSaveIntent(this, null, notice, 'cs-scene-section-roster');
+        applyScenePanelSectionSetting('roster', visible, {
+            message: visible ? 'Scene roster section enabled.' : 'Scene roster section hidden.',
+        });
+    });
+    $(document).on('change', '#cs-scene-section-active', function() {
+        const visible = $(this).prop('checked');
+        const notice = this?.dataset?.changeNotice
+            || `Active characters section will ${visible ? 'be shown' : 'be hidden'} in the panel.`;
+        announceAutoSaveIntent(this, null, notice, 'cs-scene-section-active');
+        applyScenePanelSectionSetting('activeCharacters', visible, {
+            message: visible ? 'Active characters section enabled.' : 'Active characters section hidden.',
+        });
+    });
+    $(document).on('change', '#cs-scene-section-log', function() {
+        const visible = $(this).prop('checked');
+        const notice = this?.dataset?.changeNotice
+            || `Live log section will ${visible ? 'be shown' : 'be hidden'} in the panel.`;
+        announceAutoSaveIntent(this, null, notice, 'cs-scene-section-log');
+        applyScenePanelSectionSetting('liveLog', visible, {
+            message: visible ? 'Live log section enabled.' : 'Live log section hidden.',
+        });
+    });
+    $(document).on('change', '#cs-scene-section-coverage', function() {
+        const visible = $(this).prop('checked');
+        const notice = this?.dataset?.changeNotice
+            || `Coverage suggestions will ${visible ? 'be shown' : 'be hidden'} in the panel.`;
+        announceAutoSaveIntent(this, null, notice, 'cs-scene-section-coverage');
+        applyScenePanelSectionSetting('coverage', visible, {
+            message: visible ? 'Coverage suggestions section enabled.' : 'Coverage suggestions section hidden.',
+        });
+    });
+    $(document).on('change', '#cs-scene-show-avatars', function() {
+        const showAvatars = $(this).prop('checked');
+        const notice = this?.dataset?.changeNotice
+            || `Roster avatars will ${showAvatars ? 'be shown' : 'be hidden'} in the scene panel.`;
+        announceAutoSaveIntent(this, null, notice, 'cs-scene-show-avatars');
+        applyScenePanelShowAvatarsSetting(showAvatars, {
+            message: showAvatars ? 'Roster avatars enabled.' : 'Roster avatars hidden.',
+        });
+    });
+    $(document).on('change', '#cs-scene-auto-pin', function() {
+        const enabled = $(this).prop('checked');
+        const notice = this?.dataset?.changeNotice
+            || `Top active character will ${enabled ? 'stay highlighted' : 'no longer be highlighted'} in the panel.`;
+        announceAutoSaveIntent(this, null, notice, 'cs-scene-auto-pin');
+        applyScenePanelAutoPinSetting(enabled, {
+            message: enabled ? 'Auto-pin highlight enabled.' : 'Auto-pin highlight disabled.',
+        });
+    });
+    $(document).on('click', '#cs-scene-panel-summon', function(event) {
+        event.preventDefault();
+        const scenePanelSettings = ensureScenePanelSettings(settings);
+        const isEnabled = scenePanelSettings.enabled !== false;
+        if (isEnabled) {
+            applyScenePanelEnabledSetting(false, {
+                message: 'Scene panel hidden.',
+            });
+        } else {
+            setScenePanelCollapsed(false);
+            applyScenePanelEnabledSetting(true, {
+                message: 'Scene panel enabled.',
+            });
+        }
+    });
+    $(document).on('click', '#cs-scene-panel-toggle', function(event) {
+        event.preventDefault();
+        const scenePanelSettings = ensureScenePanelSettings(settings);
+        const next = !scenePanelSettings.enabled;
+        applyScenePanelEnabledSetting(next, {
+            message: next ? 'Scene panel enabled.' : 'Scene panel hidden.',
+        });
+    });
+    $(document).on('click', '#cs-scene-section-toggle-roster', function(event) {
+        event.preventDefault();
+        const scenePanelSettings = ensureScenePanelSettings(settings);
+        const current = scenePanelSettings.sections?.roster !== false;
+        const next = !current;
+        applyScenePanelSectionSetting('roster', next, {
+            message: next ? 'Scene roster section enabled.' : 'Scene roster section hidden.',
+        });
+    });
+    $(document).on('click', '#cs-scene-section-toggle-active', function(event) {
+        event.preventDefault();
+        const scenePanelSettings = ensureScenePanelSettings(settings);
+        const current = scenePanelSettings.sections?.activeCharacters !== false;
+        const next = !current;
+        applyScenePanelSectionSetting('activeCharacters', next, {
+            message: next ? 'Active characters section enabled.' : 'Active characters section hidden.',
+        });
+    });
+    $(document).on('click', '#cs-scene-section-toggle-log', function(event) {
+        event.preventDefault();
+        const scenePanelSettings = ensureScenePanelSettings(settings);
+        const current = scenePanelSettings.sections?.liveLog !== false;
+        const next = !current;
+        applyScenePanelSectionSetting('liveLog', next, {
+            message: next ? 'Live log section enabled.' : 'Live log section hidden.',
+        });
+    });
+    $(document).on('click', '#cs-scene-section-toggle-coverage', function(event) {
+        event.preventDefault();
+        const scenePanelSettings = ensureScenePanelSettings(settings);
+        const current = scenePanelSettings.sections?.coverage !== false;
+        const next = !current;
+        applyScenePanelSectionSetting('coverage', next, {
+            message: next ? 'Coverage suggestions section enabled.' : 'Coverage suggestions section hidden.',
+        });
+    });
+    $(document).on('click', '#cs-scene-panel-toggle-auto-open', function(event) {
+        event.preventDefault();
+        const scenePanelSettings = ensureScenePanelSettings(settings);
+        const next = !scenePanelSettings.autoOpenOnResults;
+        applyScenePanelAutoOpenResultsSetting(next, {
+            message: next
+                ? 'Scene panel will auto-open on new results.'
+                : 'Scene panel will stay collapsed after new results.',
+        });
+    });
+    $(document).on('click', '#cs-scene-panel-settings-open-extension', function(event) {
+        event.preventDefault();
+        if (openExtensionSettingsView()) {
+            showStatus('Opening Costume Switcher settings…', 'info');
+            closeScenePanelLayer();
+        } else {
+            showStatus('Open the Extensions drawer to access the full Costume Switcher settings.', 'warning');
+        }
+    });
+    $(document).on('click', '#cs-scene-manage-roster', handleScenePanelManageRoster);
+    $(document).on('click', '#cs-scene-clear-roster', handleScenePanelClearRoster);
+    $(document).on('click', '#cs-scene-refresh', handleScenePanelRefresh);
+    $(document).on('click', '#cs-scene-focus-toggle', handleScenePanelFocusToggle);
+    $(document).on('click', '#cs-scene-log-expand', handleScenePanelExpandLog);
+    $(document).on('click', '#cs-scene-log-copy', handleScenePanelCopyLog);
+    $(document).on('click', '#cs-scene-open-settings', handleScenePanelOpenSettings);
+    $(document).on('submit', '#cs-scene-manager-form', handleSceneManagerSubmit);
+    $(document).on('click', '.cs-scene-manager__toggle', handleSceneManagerToggle);
+    $(document).on('click', '.cs-scene-manager__remove', handleSceneManagerRemove);
+    $(document).on('click', '[data-scene-panel="close-layer"]', () => closeScenePanelLayer());
+    $(document).on('click', '#cs-scene-panel-layer', function(event) {
+        if (event.target === this) {
+            closeScenePanelLayer();
+        }
+    });
+    $(document).on('keydown', function(event) {
+        if (event.key === "Escape" && isScenePanelLayerOpen()) {
+            closeScenePanelLayer();
+        }
     });
     $(document).on('click', '#cs-save', () => {
         const button = document.getElementById('cs-save');
@@ -5294,6 +8545,7 @@ function wireUI() {
             syncProfileFieldsToUI(profile, [field]);
             recompileRegexes();
             refreshCoverageFromLastReport();
+            requestScenePanelRender("coverage-pill", { immediate: true });
             showStatus(`Added "${escapeHtml(value)}" to ${field.replace(/([A-Z])/g, ' $1').toLowerCase()}.`, 'success');
             scheduleProfileAutoSave({
                 key: field,
@@ -5440,6 +8692,107 @@ function normalizeMessageKey(value) {
     return trimmed;
 }
 
+function isLikelyMessageKey(candidate) {
+    if (candidate == null) {
+        return false;
+    }
+
+    const normalized = typeof candidate === "string"
+        ? (normalizeMessageKey(candidate) || candidate.trim())
+        : normalizeMessageKey(candidate);
+
+    if (typeof normalized !== "string" || !normalized) {
+        return false;
+    }
+
+    if (/^m\d+$/.test(normalized)) {
+        return true;
+    }
+
+    if (normalized.toLowerCase().startsWith("tester:")) {
+        return true;
+    }
+
+    return false;
+}
+
+function extractSceneMessageDigest(message) {
+    if (!message || typeof message !== "object") {
+        return null;
+    }
+
+    const parts = [];
+
+    const pushValue = (label, value) => {
+        if (value == null) {
+            return;
+        }
+        if (typeof value === "number" && !Number.isFinite(value)) {
+            return;
+        }
+        if (typeof value === "string") {
+            const trimmed = value.trim();
+            if (!trimmed) {
+                return;
+            }
+            parts.push(`${label}:${trimmed}`);
+            return;
+        }
+        parts.push(`${label}:${value}`);
+    };
+
+    const pushNumber = (label, value) => {
+        if (Number.isFinite(value)) {
+            parts.push(`${label}:${value}`);
+        }
+    };
+
+    pushValue("chat", message.chat_id ?? message.chatId ?? message.conversation_id ?? message.conversationId ?? message.cid ?? null);
+    pushNumber("character", message.character_id ?? message.characterId ?? message.chid);
+    pushNumber("id", message.mesId);
+    pushNumber("swipe", message.swipe_id);
+
+    const textSource = typeof message.mes === "string" && message.mes.length
+        ? message.mes
+        : (typeof message.text === "string" ? message.text : "");
+    if (textSource) {
+        const slice = textSource.length > 64 ? textSource.slice(-64) : textSource;
+        pushValue("text", `${slice.length}:${slice}`);
+    }
+
+    const resolveTimestamp = () => {
+        if (Number.isFinite(message.updatedAt)) return message.updatedAt;
+        if (Number.isFinite(message.lastModified)) return message.lastModified;
+        if (Number.isFinite(message.timestamp)) return message.timestamp;
+        if (message.extra && typeof message.extra === "object") {
+            const extra = message.extra;
+            if (Number.isFinite(extra.updatedAt)) return extra.updatedAt;
+            if (Number.isFinite(extra.last_update)) return extra.last_update;
+            if (Number.isFinite(extra.lastUpdated)) return extra.lastUpdated;
+        }
+        return null;
+    };
+
+    const timestamp = resolveTimestamp();
+    if (timestamp != null) {
+        parts.push(`ts:${timestamp}`);
+    }
+
+    return parts.length ? parts.join("|") : null;
+}
+
+function deriveSceneDigestFromText(text) {
+    if (typeof text !== "string") {
+        return null;
+    }
+    const trimmed = text.trim();
+    if (!trimmed) {
+        return null;
+    }
+    const slice = trimmed.length > 64 ? trimmed.slice(-64) : trimmed;
+    return `text:${slice.length}:${slice}`;
+}
+
 function extractMessageIdFromKey(key) {
     const normalized = normalizeMessageKey(key);
     if (!normalized) return null;
@@ -5454,6 +8807,7 @@ function parseMessageReference(input) {
     const commitKey = (candidate) => {
         const normalized = normalizeMessageKey(candidate);
         if (!normalized) return;
+        if (!isLikelyMessageKey(normalized)) return;
         if (!key) key = normalized;
         if (messageId == null) {
             const parsed = extractMessageIdFromKey(normalized);
@@ -5546,8 +8900,324 @@ function summarizeMatches(matches) {
     return stats;
 }
 
-function updateMessageAnalytics(bufKey, text, { rosterSet, updateSession = true, assumeNormalized = false } = {}) {
-    if (!bufKey) {
+function createDetectionContext(bufferOffset = 0) {
+    const offset = Number.isFinite(bufferOffset) ? Math.max(0, Math.floor(bufferOffset)) : 0;
+    return {
+        lastProcessedAbsolute: offset - 1,
+        quoteState: {
+            ranges: [],
+            stack: [],
+            windowOffset: offset,
+            lastIndex: offset - 1,
+        },
+        matchCache: {
+            matches: [],
+            processedAbsolute: offset - 1,
+            windowOffset: offset,
+            tokenCount: null,
+            tokenizerId: null,
+            minTokenIndex: null,
+        },
+        metrics: {
+            incrementalRuns: 0,
+            incrementalChars: 0,
+            fullRuns: 0,
+            fullChars: 0,
+        },
+    };
+}
+
+function ensureDetectionContext(msgState, bufferOffset = 0) {
+    if (!msgState || typeof msgState !== "object") {
+        return null;
+    }
+    const offset = Number.isFinite(bufferOffset) ? Math.max(0, Math.floor(bufferOffset)) : 0;
+    if (!msgState.detectionContext || typeof msgState.detectionContext !== "object") {
+        msgState.detectionContext = createDetectionContext(offset);
+        return msgState.detectionContext;
+    }
+
+    const context = msgState.detectionContext;
+
+    if (!context.quoteState || typeof context.quoteState !== "object") {
+        context.quoteState = createDetectionContext(offset).quoteState;
+    }
+    if (!Array.isArray(context.quoteState.ranges)) {
+        context.quoteState.ranges = [];
+    }
+    if (!Array.isArray(context.quoteState.stack)) {
+        context.quoteState.stack = [];
+    }
+    context.quoteState.windowOffset = Number.isFinite(context.quoteState.windowOffset)
+        ? Math.max(0, Math.floor(context.quoteState.windowOffset))
+        : offset;
+    if (!Number.isFinite(context.quoteState.lastIndex)) {
+        context.quoteState.lastIndex = context.quoteState.windowOffset - 1;
+    }
+
+    if (!context.matchCache || typeof context.matchCache !== "object") {
+        context.matchCache = createDetectionContext(offset).matchCache;
+    }
+    if (!Array.isArray(context.matchCache.matches)) {
+        context.matchCache.matches = [];
+    }
+    context.matchCache.windowOffset = Number.isFinite(context.matchCache.windowOffset)
+        ? Math.max(0, Math.floor(context.matchCache.windowOffset))
+        : offset;
+    if (!Number.isFinite(context.matchCache.processedAbsolute)) {
+        context.matchCache.processedAbsolute = context.matchCache.windowOffset - 1;
+    }
+
+    if (!context.metrics || typeof context.metrics !== "object") {
+        context.metrics = createDetectionContext(offset).metrics;
+    }
+    const metrics = context.metrics;
+    if (!Number.isFinite(metrics.incrementalRuns)) {
+        metrics.incrementalRuns = 0;
+    }
+    if (!Number.isFinite(metrics.incrementalChars)) {
+        metrics.incrementalChars = 0;
+    }
+    if (!Number.isFinite(metrics.fullRuns)) {
+        metrics.fullRuns = 0;
+    }
+    if (!Number.isFinite(metrics.fullChars)) {
+        metrics.fullChars = 0;
+    }
+    if (!Number.isFinite(context.lastProcessedAbsolute)) {
+        context.lastProcessedAbsolute = context.matchCache.processedAbsolute;
+    }
+
+    return context;
+}
+
+function shiftDetectionContext(msgState, newBufferOffset) {
+    const context = ensureDetectionContext(msgState, newBufferOffset);
+    if (!context) {
+        return;
+    }
+    const offset = Number.isFinite(newBufferOffset) ? Math.max(0, Math.floor(newBufferOffset)) : 0;
+
+    if (context.matchCache && Array.isArray(context.matchCache.matches)) {
+        context.matchCache.matches = context.matchCache.matches.filter((match) => {
+            if (!match || !Number.isFinite(match.absoluteIndex)) {
+                return true;
+            }
+            return match.absoluteIndex >= offset;
+        });
+        if (!Number.isFinite(context.matchCache.processedAbsolute) || context.matchCache.processedAbsolute < offset - 1) {
+            context.matchCache.processedAbsolute = offset - 1;
+        }
+        context.matchCache.windowOffset = offset;
+    }
+
+    if (context.quoteState) {
+        if (!Array.isArray(context.quoteState.ranges)) {
+            context.quoteState.ranges = [];
+        } else {
+            context.quoteState.ranges = context.quoteState.ranges.filter((range) => {
+                if (!Array.isArray(range) || range.length < 2) {
+                    return false;
+                }
+                const [, end] = range;
+                return Number.isFinite(end) ? end >= offset : true;
+            });
+        }
+        if (!Array.isArray(context.quoteState.stack)) {
+            context.quoteState.stack = [];
+        } else {
+            context.quoteState.stack = context.quoteState.stack.filter((frame) => {
+                if (!frame || !Number.isFinite(frame.index)) {
+                    return false;
+                }
+                return frame.index >= offset;
+            });
+        }
+        context.quoteState.windowOffset = offset;
+        if (!Number.isFinite(context.quoteState.lastIndex) || context.quoteState.lastIndex < offset - 1) {
+            context.quoteState.lastIndex = offset - 1;
+        }
+    }
+
+    if (!Number.isFinite(context.lastProcessedAbsolute) || context.lastProcessedAbsolute < offset - 1) {
+        context.lastProcessedAbsolute = offset - 1;
+    }
+}
+
+function ensureMatchCache(normalizedKey, messageState = null) {
+    if (!(state.messageMatches instanceof Map)) {
+        state.messageMatches = new Map();
+    }
+
+    if (messageState) {
+        const context = ensureDetectionContext(messageState, messageState.bufferOffset || 0);
+        if (context?.matchCache) {
+            state.messageMatches.set(normalizedKey, context.matchCache);
+            return context.matchCache;
+        }
+    }
+
+    let cache = state.messageMatches.get(normalizedKey);
+    if (!cache || typeof cache !== "object" || !Array.isArray(cache.matches)) {
+        const fallbackContext = createDetectionContext(0);
+        cache = fallbackContext.matchCache;
+        state.messageMatches.set(normalizedKey, cache);
+    }
+    return cache;
+}
+
+function normalizeMatchForCache(match, bufferOffset) {
+    const matchLength = Number.isFinite(match.matchLength) && match.matchLength > 0
+        ? Math.floor(match.matchLength)
+        : null;
+    const absoluteIndex = Number.isFinite(match.matchIndex)
+        ? match.matchIndex + bufferOffset
+        : null;
+    const tokenIndex = Number.isFinite(match.tokenIndex)
+        ? Math.floor(match.tokenIndex)
+        : null;
+    const tokenLength = Number.isFinite(match.tokenLength) && match.tokenLength > 0
+        ? Math.floor(match.tokenLength)
+        : null;
+    return {
+        name: match.name,
+        matchKind: match.matchKind,
+        matchLength,
+        priority: match.priority,
+        absoluteIndex,
+        tokenIndex,
+        tokenLength,
+    };
+}
+
+function normalizeStoredMatch(match, bufferOffset = 0) {
+    if (!match) {
+        return null;
+    }
+    const matchLength = Number.isFinite(match.matchLength) && match.matchLength > 0
+        ? Math.floor(match.matchLength)
+        : null;
+    let absoluteIndex = null;
+    if (Number.isFinite(match.absoluteIndex)) {
+        absoluteIndex = match.absoluteIndex;
+    } else if (Number.isFinite(match.matchIndex)) {
+        absoluteIndex = match.matchIndex + bufferOffset;
+    }
+    const tokenIndex = Number.isFinite(match.tokenIndex)
+        ? Math.floor(match.tokenIndex)
+        : null;
+    const tokenLength = Number.isFinite(match.tokenLength) && match.tokenLength > 0
+        ? Math.floor(match.tokenLength)
+        : null;
+    return {
+        name: match.name,
+        matchKind: match.matchKind,
+        matchLength,
+        priority: match.priority,
+        absoluteIndex,
+        tokenIndex,
+        tokenLength,
+    };
+}
+
+function computeAbsoluteEnd(match) {
+    if (!match || !Number.isFinite(match.absoluteIndex)) {
+        return null;
+    }
+    if (!Number.isFinite(match.matchLength) || match.matchLength <= 0) {
+        return match.absoluteIndex;
+    }
+    return match.absoluteIndex + match.matchLength - 1;
+}
+
+function projectMatchesForBuffer(cache, bufferOffset, textLength) {
+    if (!cache || !Array.isArray(cache.matches)) {
+        return [];
+    }
+    const limit = bufferOffset + textLength;
+    const projected = cache.matches
+        .filter((match) => !Number.isFinite(match.absoluteIndex)
+            || (match.absoluteIndex >= bufferOffset && match.absoluteIndex < limit))
+        .map((match) => {
+            const relativeIndex = Number.isFinite(match.absoluteIndex)
+                ? match.absoluteIndex - bufferOffset
+                : null;
+            return {
+                name: match.name,
+                matchKind: match.matchKind,
+                matchLength: match.matchLength,
+                priority: match.priority,
+                matchIndex: relativeIndex,
+                absoluteIndex: match.absoluteIndex,
+                tokenIndex: Number.isFinite(match.tokenIndex) ? Math.floor(match.tokenIndex) : null,
+                tokenLength: Number.isFinite(match.tokenLength) && match.tokenLength > 0
+                    ? Math.floor(match.tokenLength)
+                    : null,
+            };
+        });
+    projected.tokenCount = Number.isFinite(cache.tokenCount) ? cache.tokenCount : null;
+    projected.tokenizerId = cache.tokenizerId || null;
+    projected.minTokenIndex = Number.isFinite(cache.minTokenIndex) ? cache.minTokenIndex : null;
+    return projected;
+}
+
+function areStatsEqual(previousStats, nextStats) {
+    const prev = previousStats instanceof Map ? previousStats : new Map();
+    const next = nextStats instanceof Map ? nextStats : new Map();
+    if (prev.size !== next.size) {
+        return false;
+    }
+    for (const [key, value] of prev.entries()) {
+        if (next.get(key) !== value) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function areRankingsEqual(previousRanking, nextRanking) {
+    const prev = Array.isArray(previousRanking) ? previousRanking : [];
+    const next = Array.isArray(nextRanking) ? nextRanking : [];
+    if (prev.length !== next.length) {
+        return false;
+    }
+    const keys = [
+        "name",
+        "normalized",
+        "count",
+        "bestPriority",
+        "earliest",
+        "latest",
+        "inSceneRoster",
+        "firstMatchKind",
+        "score",
+    ];
+    for (let i = 0; i < prev.length; i += 1) {
+        const a = prev[i] || {};
+        const b = next[i] || {};
+        for (const key of keys) {
+            if ((a[key] ?? null) !== (b[key] ?? null)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+function updateMessageAnalytics(bufKey, text, options = {}) {
+    const {
+        rosterSet,
+        updateSession = true,
+        assumeNormalized = false,
+        bufferOffset: explicitBufferOffset = 0,
+        incremental = false,
+        startIndex = null,
+        previousProcessedAbsolute = null,
+        messageState = null,
+    } = options;
+
+    const normalizedKey = bufKey ? (normalizeMessageKey(bufKey) || bufKey) : bufKey;
+    if (!normalizedKey) {
         return { stats: new Map(), ranking: [] };
     }
 
@@ -5559,27 +9229,204 @@ function updateMessageAnalytics(bufKey, text, { rosterSet, updateSession = true,
         state.topSceneRanking = new Map();
     }
 
-    const normalizedText = typeof text === 'string' ? (assumeNormalized ? text : normalizeStreamText(text)) : '';
+    const normalizedText = typeof text === "string" ? (assumeNormalized ? text : normalizeStreamText(text)) : "";
     const profile = getActiveProfile();
-    const matches = normalizedText ? findAllMatches(normalizedText) : [];
-    const stats = summarizeMatches(matches);
+    const bufferOffset = Number.isFinite(explicitBufferOffset) ? Math.max(0, Math.floor(explicitBufferOffset)) : 0;
+    const context = messageState ? ensureDetectionContext(messageState, bufferOffset) : null;
+    const cache = ensureMatchCache(normalizedKey, messageState);
 
-    state.messageStats.set(bufKey, stats);
+    const textLength = normalizedText.length;
+    const explicitMinIndex = Number.isFinite(options?.minIndex) && options.minIndex >= 0
+        ? Math.max(0, Math.floor(options.minIndex))
+        : null;
 
-    const ranking = rankSceneCharacters(matches, {
+    if (!incremental || !context) {
+        const detectionOptions = {};
+        if (explicitMinIndex != null) {
+            detectionOptions.minIndex = explicitMinIndex;
+        }
+        if (context?.quoteState) {
+            detectionOptions.quoteState = context.quoteState;
+            detectionOptions.bufferOffset = bufferOffset;
+            detectionOptions.lastIndex = context.lastProcessedAbsolute;
+        }
+        const matches = normalizedText
+            ? findAllMatches(normalizedText, detectionOptions)
+            : [];
+        cache.matches = matches.map((match) => normalizeMatchForCache(match, bufferOffset));
+        cache.tokenCount = Number.isFinite(matches.tokenCount) ? matches.tokenCount : null;
+        cache.tokenizerId = matches.tokenizerId || null;
+        cache.minTokenIndex = Number.isFinite(matches.minTokenIndex) ? matches.minTokenIndex : null;
+        const absoluteTail = textLength > 0
+            ? bufferOffset + textLength - 1
+            : bufferOffset - 1;
+        cache.processedAbsolute = absoluteTail;
+        if (context) {
+            context.lastProcessedAbsolute = absoluteTail;
+            if (textLength > 0) {
+                context.metrics.fullRuns += 1;
+                context.metrics.fullChars += textLength;
+            }
+        }
+    } else if (normalizedText) {
+        const resumeRelative = Number.isFinite(context.lastProcessedAbsolute)
+            ? Math.max(0, context.lastProcessedAbsolute + 1 - bufferOffset)
+            : 0;
+        const requestedStart = Number.isFinite(startIndex) && startIndex >= 0
+            ? Math.min(Math.floor(startIndex), textLength)
+            : 0;
+        const relativeStart = Math.min(textLength, Math.max(resumeRelative, requestedStart));
+        const effectiveMinIndex = explicitMinIndex != null
+            ? Math.max(explicitMinIndex, relativeStart)
+            : relativeStart;
+        const scanStartIndex = Math.max(0, relativeStart - INCREMENTAL_SCAN_PADDING);
+        const detectionOptions = {
+            startIndex: scanStartIndex,
+            minIndex: effectiveMinIndex,
+        };
+        if (context?.quoteState) {
+            detectionOptions.quoteState = context.quoteState;
+            detectionOptions.lastIndex = context.lastProcessedAbsolute;
+            detectionOptions.bufferOffset = bufferOffset;
+        }
+        const newMatches = findAllMatches(normalizedText, detectionOptions);
+        if (Number.isFinite(newMatches.tokenCount)) {
+            cache.tokenCount = newMatches.tokenCount;
+        }
+        if (newMatches.tokenizerId) {
+            cache.tokenizerId = newMatches.tokenizerId;
+        }
+        if (Number.isFinite(newMatches.minTokenIndex)) {
+            cache.minTokenIndex = newMatches.minTokenIndex;
+        }
+        const processedBoundary = Number.isFinite(context.lastProcessedAbsolute)
+            ? context.lastProcessedAbsolute
+            : (Number.isFinite(cache.processedAbsolute)
+                ? cache.processedAbsolute
+                : (Number.isFinite(previousProcessedAbsolute)
+                    ? previousProcessedAbsolute
+                    : bufferOffset + relativeStart - 1));
+        const inserted = [];
+        newMatches
+            .map((match) => normalizeMatchForCache(match, bufferOffset))
+            .forEach((match) => {
+                const absoluteEnd = computeAbsoluteEnd(match);
+                if (Number.isFinite(absoluteEnd) && absoluteEnd <= processedBoundary) {
+                    return;
+                }
+                cache.matches.push(match);
+                inserted.push(match);
+            });
+        if (inserted.length > 0 && cache.matches.length > 1) {
+            cache.matches.sort((a, b) => {
+                const aIndex = Number.isFinite(a.absoluteIndex) ? a.absoluteIndex : Number.POSITIVE_INFINITY;
+                const bIndex = Number.isFinite(b.absoluteIndex) ? b.absoluteIndex : Number.POSITIVE_INFINITY;
+                return aIndex - bIndex;
+            });
+        }
+        const newAbsoluteTail = textLength > 0
+            ? bufferOffset + textLength - 1
+            : bufferOffset - 1;
+        const previousProcessed = Number.isFinite(cache.processedAbsolute)
+            ? cache.processedAbsolute
+            : bufferOffset - 1;
+        cache.processedAbsolute = Math.max(previousProcessed, newAbsoluteTail);
+        context.lastProcessedAbsolute = Math.max(
+            Number.isFinite(context.lastProcessedAbsolute) ? context.lastProcessedAbsolute : newAbsoluteTail,
+            newAbsoluteTail,
+        );
+        const scannedChars = Math.max(0, textLength - relativeStart);
+        if (scannedChars > 0) {
+            context.metrics.incrementalRuns += 1;
+            context.metrics.incrementalChars += scannedChars;
+        }
+    }
+
+    const nextStats = summarizeMatches(cache.matches);
+    const previousStats = state.messageStats.get(normalizedKey);
+    const statsChanged = !areStatsEqual(previousStats, nextStats);
+    if (statsChanged || !(previousStats instanceof Map)) {
+        state.messageStats.set(normalizedKey, nextStats);
+    }
+
+    const visibleMatches = projectMatchesForBuffer(cache, bufferOffset, textLength);
+
+    const ranking = rankSceneCharacters(visibleMatches, {
         rosterSet,
         profile,
         distancePenaltyWeight: resolveNumericSetting(profile?.distancePenaltyWeight, PROFILE_DEFAULTS.distancePenaltyWeight),
         rosterBonus: resolveNumericSetting(profile?.rosterBonus, PROFILE_DEFAULTS.rosterBonus),
         priorityMultiplier: 100,
+        tokenLength: Number.isFinite(visibleMatches?.tokenCount) ? visibleMatches.tokenCount : null,
     });
-    state.topSceneRanking.set(bufKey, ranking);
-
-    if (updateSession !== false) {
-        updateSessionTopCharacters(bufKey, ranking);
+    const previousRanking = state.topSceneRanking.get(normalizedKey) || [];
+    const rankingChanged = !areRankingsEqual(previousRanking, ranking);
+    if (rankingChanged || !Array.isArray(previousRanking)) {
+        state.topSceneRanking.set(normalizedKey, ranking);
     }
 
-    return { stats, ranking, matches };
+    const timestamp = Date.now();
+    if (!(state.topSceneRankingUpdatedAt instanceof Map)) {
+        state.topSceneRankingUpdatedAt = new Map();
+    }
+    if (rankingChanged) {
+        state.topSceneRankingUpdatedAt.set(normalizedKey, timestamp);
+        if (updateSession !== false) {
+            updateSessionTopCharacters(normalizedKey, ranking, timestamp);
+        } else if (state.latestTopRanking?.bufKey && normalizeMessageKey(state.latestTopRanking.bufKey) === normalizedKey) {
+            state.latestTopRanking.updatedAt = timestamp;
+        }
+    } else if (updateSession === false && state.latestTopRanking?.bufKey && normalizeMessageKey(state.latestTopRanking.bufKey) === normalizedKey) {
+        state.latestTopRanking.updatedAt = timestamp;
+    }
+
+    if (statsChanged || rankingChanged) {
+        requestScenePanelRender("analytics-update");
+    }
+
+    const statsResult = statsChanged ? nextStats : (previousStats instanceof Map ? previousStats : nextStats);
+    const rankingResult = rankingChanged ? ranking : previousRanking;
+
+    return {
+        stats: statsResult,
+        ranking: rankingResult,
+        matches: visibleMatches,
+    };
+}
+
+function resolveBufferOffsetForKey(key) {
+    const normalizedKey = normalizeMessageKey(key);
+    if (!normalizedKey) {
+        return 0;
+    }
+    if (state.perMessageStates instanceof Map) {
+        const msgState = state.perMessageStates.get(normalizedKey);
+        if (msgState && Number.isFinite(msgState.bufferOffset)) {
+            return Math.max(0, Math.floor(msgState.bufferOffset));
+        }
+    }
+    return 0;
+}
+
+function getCachedMatchesForBuffer(key, bufferLength = null) {
+    const normalizedKey = normalizeMessageKey(key);
+    if (!normalizedKey || !(state.messageMatches instanceof Map)) {
+        return [];
+    }
+    const cache = state.messageMatches.get(normalizedKey);
+    if (!cache) {
+        return [];
+    }
+    const bufferOffset = resolveBufferOffsetForKey(normalizedKey);
+    const length = Number.isFinite(bufferLength) && bufferLength >= 0
+        ? bufferLength
+        : (() => {
+            if (Number.isFinite(cache.processedAbsolute)) {
+                return Math.max(0, cache.processedAbsolute - bufferOffset + 1);
+            }
+            return 0;
+        })();
+    return projectMatchesForBuffer(cache, bufferOffset, length);
 }
 
 function calculateFinalMessageStats(reference) {
@@ -5591,20 +9438,21 @@ function calculateFinalMessageStats(reference) {
         return;
     }
 
-    trackMessageKey(bufKey);
+    const normalizedKey = normalizeMessageKey(bufKey) || bufKey;
+    trackMessageKey(normalizedKey);
 
-    const resolvedMessageId = Number.isFinite(messageId) ? messageId : extractMessageIdFromKey(bufKey);
+    const resolvedMessageId = Number.isFinite(messageId) ? messageId : extractMessageIdFromKey(normalizedKey);
 
-    let fullText = state.perMessageBuffers.get(bufKey);
-    if (!fullText && requestedKey && requestedKey !== bufKey && state.perMessageBuffers.has(requestedKey)) {
+    let fullText = state.perMessageBuffers.get(normalizedKey);
+    if (!fullText && requestedKey && requestedKey !== normalizedKey && state.perMessageBuffers.has(requestedKey)) {
         fullText = state.perMessageBuffers.get(requestedKey);
     }
 
     if (!fullText) {
-        debugLog("Could not find message buffer to calculate stats for:", bufKey);
+        debugLog("Could not find message buffer to calculate stats for:", normalizedKey);
         const { chat } = getContext();
         if (!Number.isFinite(resolvedMessageId)) {
-            debugLog("No valid message id available to fall back to chat context for key:", bufKey);
+            debugLog("No valid message id available to fall back to chat context for key:", normalizedKey);
             return;
         }
 
@@ -5613,11 +9461,396 @@ function calculateFinalMessageStats(reference) {
         fullText = normalizeStreamText(message.mes);
     }
 
-    const msgState = state.perMessageStates.get(bufKey);
+    const msgState = state.perMessageStates.get(normalizedKey);
     const rosterSet = msgState?.sceneRoster instanceof Set ? msgState.sceneRoster : null;
-    updateMessageAnalytics(bufKey, fullText, { rosterSet, assumeNormalized: true });
+    updateMessageAnalytics(normalizedKey, fullText, { rosterSet, assumeNormalized: true, messageState: msgState });
 
-    debugLog("Final stats calculated for", bufKey, state.messageStats.get(bufKey));
+    debugLog("Final stats calculated for", normalizedKey, state.messageStats.get(normalizedKey));
+    requestScenePanelRender("final-stats", { immediate: true });
+    maybeAutoExpandScenePanel("result");
+}
+
+function collectDecisionEventsForKey(bufKey) {
+    const normalizedKey = normalizeMessageKey(bufKey);
+    if (!normalizedKey || !Array.isArray(state.recentDecisionEvents)) {
+        return [];
+    }
+    return state.recentDecisionEvents
+        .filter((event) => normalizeMessageKey(event?.messageKey) === normalizedKey)
+        .map((event) => cloneDecisionEvent(event))
+        .filter(Boolean);
+}
+
+function isSystemMessage(message) {
+    return Boolean(message?.is_system);
+}
+
+function isNarratorMessage(message) {
+    if (!message || typeof message !== "object") {
+        return false;
+    }
+    const narratorType = system_message_types?.NARRATOR;
+    if (typeof narratorType !== "string" || !message.extra || typeof message.extra !== "object") {
+        return false;
+    }
+    return message.extra.type === narratorType;
+}
+
+function isSystemOrNarratorMessage(message) {
+    return isSystemMessage(message) || isNarratorMessage(message);
+}
+
+function isAssistantLikeMessage(message) {
+    if (!message || typeof message !== "object") {
+        return false;
+    }
+    if (message.is_user) {
+        return false;
+    }
+    if (isSystemOrNarratorMessage(message)) {
+        return false;
+    }
+    return true;
+}
+
+function findChatMessageById(messageId) {
+    if (!Number.isFinite(messageId)) {
+        return null;
+    }
+    const { chat } = getContext();
+    if (!Array.isArray(chat)) {
+        return null;
+    }
+    const candidate = chat.find((message) => message && message.mesId === messageId) || null;
+    if (!candidate) {
+        return null;
+    }
+    if (isSystemOrNarratorMessage(candidate)) {
+        return null;
+    }
+    return candidate;
+}
+
+function findChatMessageByKey(key) {
+    const normalizedKey = normalizeMessageKey(key);
+    if (!normalizedKey) {
+        return null;
+    }
+    const resolvedId = extractMessageIdFromKey(normalizedKey);
+    const direct = findChatMessageById(resolvedId);
+    if (direct && isAssistantLikeMessage(direct)) {
+        return direct;
+    }
+    const { chat } = getContext();
+    if (!Array.isArray(chat)) {
+        return null;
+    }
+    for (let i = chat.length - 1; i >= 0; i -= 1) {
+        const message = chat[i];
+        if (!isAssistantLikeMessage(message)) {
+            continue;
+        }
+        const candidateKey = normalizeMessageKey(message?.message_key || message?.key || `m${message.mesId}`);
+        if (candidateKey === normalizedKey) {
+            return message;
+        }
+    }
+    return null;
+}
+
+function collectDisplayNameMap(roster, events, existingEntries = []) {
+    const map = fromDisplayNameEntries(existingEntries);
+    events.forEach((event) => {
+        if (!event) {
+            return;
+        }
+        const normalized = normalizeRosterKey(event.normalized || event.name);
+        if (!normalized) {
+            return;
+        }
+        if (typeof event.name === "string" && event.name.trim() && !map.has(normalized)) {
+            map.set(normalized, event.name.trim());
+        }
+    });
+    roster.forEach((value) => {
+        const normalized = normalizeRosterKey(value);
+        if (!normalized || map.has(normalized)) {
+            return;
+        }
+        const fallback = normalized.charAt(0).toUpperCase() + normalized.slice(1);
+        map.set(normalized, fallback);
+    });
+    return map;
+}
+
+function getOutcomeBucket(message, create = false) {
+    if (!message || typeof message !== "object") {
+        return null;
+    }
+    if (!message.extra || typeof message.extra !== "object") {
+        if (!create) {
+            return null;
+        }
+        message.extra = {};
+    }
+    const existing = message.extra[MESSAGE_OUTCOME_STORAGE_KEY];
+    if (existing && typeof existing === "object") {
+        return existing;
+    }
+    if (create) {
+        message.extra[MESSAGE_OUTCOME_STORAGE_KEY] = {};
+        return message.extra[MESSAGE_OUTCOME_STORAGE_KEY];
+    }
+    return null;
+}
+
+function persistSceneOutcome(message, swipeId, outcome) {
+    if (!message || typeof message !== "object" || message.is_user || isSystemOrNarratorMessage(message)) {
+        return;
+    }
+    const bucket = getOutcomeBucket(message, true);
+    if (!bucket) {
+        return;
+    }
+    bucket[swipeId] = outcome;
+}
+
+function captureSceneOutcomeForMessage(reference) {
+    const { key: requestedKey, messageId } = parseMessageReference(reference);
+    const bufKey = findExistingMessageKey(requestedKey, messageId);
+    if (!bufKey) {
+        return;
+    }
+    const normalizedKey = normalizeMessageKey(bufKey);
+    const resolvedId = Number.isFinite(messageId) ? messageId : extractMessageIdFromKey(normalizedKey);
+    const message = findChatMessageById(resolvedId) || findChatMessageByKey(normalizedKey);
+    if (message?.is_user || isSystemOrNarratorMessage(message)) {
+        debugLog(`Skipping scene outcome capture for non-assistant message ${normalizedKey}.`);
+        return;
+    }
+    const swipeId = Number.isFinite(message?.swipe_id) ? message.swipe_id : 0;
+    const msgState = state.perMessageStates instanceof Map ? state.perMessageStates.get(normalizedKey) : null;
+    const rosterSet = msgState?.sceneRoster instanceof Set ? msgState.sceneRoster : new Set();
+    const roster = Array.from(rosterSet).map(normalizeRosterKey).filter(Boolean);
+    const events = collectDecisionEventsForKey(normalizedKey);
+    const existingOutcome = message ? getStoredSceneOutcome(message) : null;
+    const displayNames = collectDisplayNameMap(roster, events, existingOutcome?.displayNames);
+    const stats = state.messageStats instanceof Map ? state.messageStats.get(normalizedKey) : null;
+    const timestamp = Date.now();
+    const turnsByMember = cloneRosterTurns(msgState?.rosterTurns);
+    const turnsRemaining = Number.isFinite(msgState?.defaultRosterTTL)
+        ? Math.max(0, Math.floor(msgState.defaultRosterTTL))
+        : null;
+    const buffer = state.perMessageBuffers instanceof Map ? state.perMessageBuffers.get(normalizedKey) || "" : "";
+    const matches = getCachedMatchesForBuffer(normalizedKey, buffer.length);
+
+    replaceLiveTesterOutputs(events, {
+        roster,
+        displayNames,
+        timestamp,
+        preprocessedText: state.lastPreprocessedText,
+    });
+
+    applySceneRosterUpdate({
+        key: normalizedKey,
+        messageId: Number.isFinite(resolvedId) ? resolvedId : extractMessageIdFromKey(normalizedKey),
+        roster,
+        displayNames,
+        lastMatch: events.length ? { ...events[events.length - 1] } : null,
+        updatedAt: timestamp,
+        turnsByMember,
+        turnsRemaining,
+    });
+
+    state.lastSceneSwipeId = Number.isFinite(message?.swipe_id) ? message.swipe_id : null;
+    state.lastSceneDigest = extractSceneMessageDigest(message)
+        || deriveSceneDigestFromText(message?.mes)
+        || deriveSceneDigestFromText(buffer);
+    const outcome = {
+        version: 1,
+        messageKey: normalizedKey,
+        messageId: Number.isFinite(resolvedId) ? resolvedId : null,
+        roster,
+        displayNames: toDisplayNameEntries(displayNames),
+        events: events.map((event) => ({ ...event, messageKey: normalizedKey })),
+        stats: toStatsEntries(stats),
+        buffer,
+        preprocessedText: state.lastPreprocessedText,
+        text: message?.mes || "",
+        updatedAt: timestamp,
+        lastEvent: events.length ? { ...events[events.length - 1] } : null,
+        turnsByMember: toRosterTurnEntries(turnsByMember),
+        turnsRemaining,
+        matches: matches.map((match) => ({ ...match })),
+    };
+
+    if (message) {
+        persistSceneOutcome(message, swipeId, outcome);
+        if (typeof saveChatDebounced === "function") {
+            saveChatDebounced();
+        }
+    }
+}
+
+function getStoredSceneOutcome(message) {
+    const bucket = getOutcomeBucket(message, false);
+    if (!bucket) {
+        return null;
+    }
+    const swipeId = Number.isFinite(message?.swipe_id) ? message.swipe_id : 0;
+    const entry = bucket[swipeId];
+    if (!entry || typeof entry !== "object") {
+        return null;
+    }
+    return entry;
+}
+
+function restoreSceneOutcomeForMessage(message, {
+    immediateRender = true,
+    preserveStateOnFailure = false,
+} = {}) {
+    const now = Date.now();
+    if (!message || message.is_user || isSystemOrNarratorMessage(message)) {
+        if (!preserveStateOnFailure) {
+            resetSceneState();
+            replaceLiveTesterOutputs([], { roster: [], preprocessedText: "" });
+        }
+        if (immediateRender) {
+            requestScenePanelRender("history-reset", { immediate: true });
+        }
+        return false;
+    }
+    const stored = getStoredSceneOutcome(message);
+    const fallbackKey = normalizeMessageKey(`m${message.mesId}`);
+    const messageKey = normalizeMessageKey(stored?.messageKey || fallbackKey);
+    if (!messageKey) {
+        if (!preserveStateOnFailure) {
+            resetSceneState();
+            replaceLiveTesterOutputs([], { roster: [], preprocessedText: "" });
+        }
+        if (immediateRender) {
+            requestScenePanelRender("history-reset", { immediate: true });
+        }
+        return false;
+    }
+
+    trackMessageKey(messageKey);
+    if (!(state.perMessageBuffers instanceof Map)) {
+        state.perMessageBuffers = new Map();
+    }
+
+    const buffer = typeof stored?.buffer === "string" ? stored.buffer : normalizeStreamText(message.mes || "");
+    state.perMessageBuffers.set(messageKey, buffer);
+    state.lastSceneSwipeId = Number.isFinite(message?.swipe_id) ? message.swipe_id : null;
+    state.lastSceneDigest = extractSceneMessageDigest(message)
+        || deriveSceneDigestFromText(stored?.text)
+        || deriveSceneDigestFromText(buffer);
+
+    const roster = Array.isArray(stored?.roster) ? stored.roster.filter(Boolean) : [];
+    const displayNames = collectDisplayNameMap(roster, [], stored?.displayNames);
+    const events = Array.isArray(stored?.events)
+        ? stored.events.map((event) => {
+            const clone = cloneDecisionEvent(event);
+            if (clone) {
+                clone.messageKey = messageKey;
+            }
+            return clone;
+        }).filter(Boolean)
+        : [];
+
+    overwriteRecentDecisionEvents(messageKey, events);
+
+    if (!(state.messageStats instanceof Map)) {
+        state.messageStats = new Map();
+    }
+
+    const restoredMessageState = state.perMessageStates instanceof Map
+        ? state.perMessageStates.get(messageKey)
+        : null;
+    updateMessageAnalytics(messageKey, buffer, {
+        rosterSet: new Set(roster),
+        assumeNormalized: true,
+        messageState: restoredMessageState,
+    });
+    if (Array.isArray(stored?.stats) && stored.stats.length) {
+        state.messageStats.set(messageKey, fromStatsEntries(stored.stats));
+    }
+
+    const currentSceneSnapshot = typeof getCurrentSceneSnapshot === "function"
+        ? getCurrentSceneSnapshot()
+        : null;
+    const existingUpdatedAt = Number.isFinite(currentSceneSnapshot?.updatedAt)
+        && currentSceneSnapshot.updatedAt > 0
+        ? currentSceneSnapshot.updatedAt
+        : null;
+    const storedTimestamp = Number.isFinite(stored?.updatedAt) ? stored.updatedAt : null;
+    const timestamp = storedTimestamp ?? existingUpdatedAt ?? now;
+
+    const restoredPreprocessed = typeof stored?.preprocessedText === 'string'
+        ? stored.preprocessedText
+        : buffer;
+    replaceLiveTesterOutputs(events, {
+        roster,
+        displayNames,
+        timestamp,
+        preprocessedText: restoredPreprocessed,
+    });
+
+    const resolvedId = Number.isFinite(stored?.messageId) ? stored.messageId : message.mesId;
+    const storedTurnEntries = Array.isArray(stored?.turnsByMember)
+        ? stored.turnsByMember
+        : [];
+    const turnsByMember = fromRosterTurnEntries(storedTurnEntries);
+    const turnsRemaining = Number.isFinite(stored?.turnsRemaining)
+        ? Math.max(0, Math.floor(stored.turnsRemaining))
+        : null;
+    if (turnsByMember.size === 0 && Number.isFinite(stored?.turnsRemaining)) {
+        const fallbackTurns = Math.max(0, Math.floor(stored.turnsRemaining));
+        roster.forEach((value) => {
+            const normalized = normalizeRosterKey(value);
+            if (!normalized) {
+                return;
+            }
+            turnsByMember.set(normalized, fallbackTurns);
+        });
+    }
+    const cache = ensureMatchCache(messageKey);
+    if (Array.isArray(stored?.matches) && stored.matches.length) {
+        const bufferOffset = resolveBufferOffsetForKey(messageKey);
+        cache.matches = stored.matches
+            .map((match) => normalizeStoredMatch(match, bufferOffset))
+            .filter(Boolean);
+        const maxAbsolute = cache.matches.reduce((max, match) => {
+            const end = computeAbsoluteEnd(match);
+            return Number.isFinite(end) ? Math.max(max, end) : max;
+        }, Number.NEGATIVE_INFINITY);
+        if (Number.isFinite(maxAbsolute) && maxAbsolute !== Number.NEGATIVE_INFINITY) {
+            cache.processedAbsolute = maxAbsolute;
+        } else if (!Number.isFinite(cache.processedAbsolute)) {
+            cache.processedAbsolute = buffer.length > 0
+                ? bufferOffset + buffer.length - 1
+                : bufferOffset - 1;
+        }
+    }
+
+    const preserveExistingRoster = roster.length === 0;
+
+    applySceneRosterUpdate({
+        key: messageKey,
+        messageId: Number.isFinite(resolvedId) ? resolvedId : extractMessageIdFromKey(messageKey),
+        roster,
+        displayNames,
+        lastMatch: stored?.lastEvent ? { ...stored.lastEvent } : (events.length ? { ...events[events.length - 1] } : null),
+        updatedAt: timestamp,
+        turnsByMember,
+        turnsRemaining,
+    }, preserveExistingRoster ? { preserveActiveOnEmpty: true } : undefined);
+
+    if (immediateRender) {
+        requestScenePanelRender("history-restore", { immediate: true });
+    }
+
+    return Boolean(stored);
 }
 
 
@@ -5770,10 +10003,237 @@ function confirmMessageSubject(msgState, matchedName) {
     msgState.pendingSubjectNormalized = null;
 }
 
-function createMessageState(profile, bufKey) {
-    if (!profile || !bufKey) return null;
+function shouldAdvanceRosterTTL(role) {
+    if (typeof role !== "string") {
+        return false;
+    }
+    const normalizedRole = role.trim().toLowerCase();
+    if (!normalizedRole) {
+        return false;
+    }
+    return normalizedRole === "assistant";
+}
 
-    const oldState = state.perMessageStates.size > 0 ? Array.from(state.perMessageStates.values()).pop() : null;
+function resolveMessageRoleFromArgs(args) {
+    if (!Array.isArray(args) || args.length === 0) {
+        return null;
+    }
+
+    const normalizeRole = (value) => {
+        if (typeof value !== "string") {
+            return null;
+        }
+        const trimmed = value.trim().toLowerCase();
+        if (!trimmed) {
+            return null;
+        }
+        if (["assistant", "model", "bot", "ai"].includes(trimmed)) {
+            return "assistant";
+        }
+        if (["user", "player", "human", "manual", "input"].includes(trimmed)) {
+            return "user";
+        }
+        if (["system", "narrator"].includes(trimmed)) {
+            return trimmed;
+        }
+        return null;
+    };
+
+    const narratorTokens = new Set();
+    narratorTokens.add("narrator");
+    if (system_message_types && typeof system_message_types === "object") {
+        const rawNarrator = system_message_types.NARRATOR;
+        if (typeof rawNarrator === "string") {
+            const normalizedNarrator = rawNarrator.trim().toLowerCase();
+            if (normalizedNarrator) {
+                narratorTokens.add(normalizedNarrator);
+            }
+        }
+    }
+
+    const resolveFlaggedRole = (value) => {
+        if (!value || typeof value !== "object") {
+            return null;
+        }
+        if (value.is_user === true || value.isUser === true) {
+            return "user";
+        }
+        if (value.is_system === true || value.isSystem === true) {
+            return "system";
+        }
+        if (value.is_assistant === true || value.isAssistant === true) {
+            return "assistant";
+        }
+        const extraType = value.extra?.type;
+        if (typeof extraType === "string") {
+            const trimmed = extraType.trim().toLowerCase();
+            if (trimmed) {
+                if (narratorTokens.has(trimmed)) {
+                    return "narrator";
+                }
+                const normalizedExtraRole = normalizeRole(trimmed);
+                if (normalizedExtraRole) {
+                    return normalizedExtraRole;
+                }
+            }
+        }
+        return null;
+    };
+
+    const visited = new Set();
+    const queue = [...args];
+
+    const inspectContainer = (container) => {
+        if (!container || typeof container !== "object") {
+            return null;
+        }
+
+        const flagged = resolveFlaggedRole(container);
+        if (flagged) {
+            return flagged;
+        }
+
+        queue.push(container);
+
+        if (typeof container.message === "object" && container.message !== null) {
+            const nestedFlagged = resolveFlaggedRole(container.message);
+            if (nestedFlagged) {
+                return nestedFlagged;
+            }
+            queue.push(container.message);
+        }
+
+        if (Array.isArray(container.messages) && container.messages.length > 0) {
+            for (const message of container.messages) {
+                const nestedFlagged = resolveFlaggedRole(message);
+                if (nestedFlagged) {
+                    return nestedFlagged;
+                }
+            }
+            queue.push(...container.messages);
+        }
+
+        return null;
+    };
+
+    while (queue.length > 0) {
+        const value = queue.shift();
+
+        if (typeof value === "string") {
+            const role = normalizeRole(value);
+            if (role) {
+                return role;
+            }
+            continue;
+        }
+
+        if (typeof value === "number" || typeof value === "boolean" || value == null) {
+            continue;
+        }
+
+        if (Array.isArray(value)) {
+            queue.push(...value);
+            continue;
+        }
+
+        if (typeof value !== "object") {
+            continue;
+        }
+
+        if (visited.has(value)) {
+            continue;
+        }
+        visited.add(value);
+
+        if (typeof value.role === "string" && value.role.trim()) {
+            const role = normalizeRole(value.role);
+            if (role) {
+                return role;
+            }
+            return value.role.trim().toLowerCase();
+        }
+
+        const flaggedRole = resolveFlaggedRole(value);
+        if (flaggedRole) {
+            return flaggedRole;
+        }
+
+        const candidates = [value.author, value.sender, value.source, value.type, value.generationType];
+        for (const candidate of candidates) {
+            const role = normalizeRole(candidate);
+            if (role) {
+                return role;
+            }
+        }
+
+        if (typeof value.message === "object" && value.message !== null) {
+            const nestedFlagged = resolveFlaggedRole(value.message);
+            if (nestedFlagged) {
+                return nestedFlagged;
+            }
+            queue.push(value.message);
+        }
+        if (Array.isArray(value.messages) && value.messages.length > 0) {
+            for (const message of value.messages) {
+                const nestedFlagged = resolveFlaggedRole(message);
+                if (nestedFlagged) {
+                    return nestedFlagged;
+                }
+            }
+            queue.push(...value.messages);
+        }
+        const nestedContainers = [value.detail, value.payload, value.event, value.data];
+        for (const container of nestedContainers) {
+            const nestedRole = inspectContainer(container);
+            if (nestedRole) {
+                return nestedRole;
+            }
+        }
+    }
+    return null;
+}
+
+function createMessageState(profile, bufKey, options = {}) {
+    if (!profile || !bufKey) {
+        return { state: null, initialized: false, rosterCleared: false, key: null };
+    }
+
+    const normalizedKey = normalizeMessageKey(bufKey) || bufKey;
+
+    if (!(state.perMessageStates instanceof Map)) {
+        state.perMessageStates = new Map();
+    }
+    if (!(state.perMessageBuffers instanceof Map)) {
+        state.perMessageBuffers = new Map();
+    }
+
+    if (state.perMessageStates.has(normalizedKey)) {
+        return {
+            state: state.perMessageStates.get(normalizedKey),
+            initialized: false,
+            rosterCleared: false,
+            key: normalizedKey,
+        };
+    }
+
+    let oldState = null;
+    if (state.perMessageStates.size > 0) {
+        const queue = ensureMessageQueue();
+        for (let i = queue.length - 1; i >= 0; i -= 1) {
+            const candidateKey = queue[i];
+            if (!candidateKey || candidateKey === normalizedKey) {
+                continue;
+            }
+            const candidateState = state.perMessageStates.get(candidateKey);
+            if (candidateState) {
+                oldState = candidateState;
+                break;
+            }
+        }
+        if (!oldState) {
+            oldState = Array.from(state.perMessageStates.values()).pop() || null;
+        }
+    }
 
     let pendingSubject = null;
     let pendingSubjectNormalized = null;
@@ -5786,6 +10246,59 @@ function createMessageState(profile, bufKey) {
         }
     }
 
+    const profileTTL = sanitizeRosterTurnValue(profile?.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL);
+    const advanceRosterTTL = shouldAdvanceRosterTTL(options?.messageRole);
+    const previousTurns = oldState?.rosterTurns instanceof Map ? oldState.rosterTurns : null;
+    const rosterTurns = new Map();
+    const expiredMembers = [];
+
+    if (previousTurns && previousTurns.size > 0) {
+        previousTurns.forEach((value, key) => {
+            const normalized = normalizeRosterKey(key);
+            const sanitized = sanitizeRosterTurnValue(value);
+            if (!normalized || sanitized == null) {
+                return;
+            }
+            if (!advanceRosterTTL) {
+                rosterTurns.set(normalized, sanitized);
+                return;
+            }
+            const next = sanitized - 1;
+            if (next > 0) {
+                rosterTurns.set(normalized, next);
+            } else {
+                expiredMembers.push(normalized);
+            }
+        });
+    } else if (oldState?.sceneRoster instanceof Set && oldState.sceneRoster.size > 0) {
+        const fallback = sanitizeRosterTurnValue(oldState?.rosterTTL ?? profileTTL);
+        oldState.sceneRoster.forEach((value) => {
+            const normalized = normalizeRosterKey(value);
+            if (!normalized) {
+                return;
+            }
+            if (fallback == null) {
+                expiredMembers.push(normalized);
+                return;
+            }
+            if (!advanceRosterTTL) {
+                rosterTurns.set(normalized, fallback);
+                return;
+            }
+            const next = fallback - 1;
+            if (next > 0) {
+                rosterTurns.set(normalized, next);
+            } else {
+                expiredMembers.push(normalized);
+            }
+        });
+    }
+
+    const sceneRoster = new Set(rosterTurns.keys());
+    const baseOutfitTTL = Number.isFinite(oldState?.outfitTTL)
+        ? oldState.outfitTTL
+        : profileTTL;
+
     const newState = {
         lastAcceptedName: null,
         lastAcceptedTs: 0,
@@ -5794,43 +10307,60 @@ function createMessageState(profile, bufKey) {
         lastSubjectNormalized: null,
         pendingSubject,
         pendingSubjectNormalized,
-        sceneRoster: new Set(oldState?.sceneRoster || []),
+        sceneRoster,
         outfitRoster: new Map(oldState?.outfitRoster || []),
-        rosterTTL: profile.sceneRosterTTL,
-        outfitTTL: profile.sceneRosterTTL,
+        rosterTurns,
+        defaultRosterTTL: profileTTL,
+        outfitTTL: baseOutfitTTL,
         processedLength: 0,
         lastAcceptedIndex: -1,
         bufferOffset: 0,
+        removedRoster: new Set(oldState?.removedRoster || []),
     };
 
-    if (newState.sceneRoster.size > 0) {
-        newState.rosterTTL--;
-        if (newState.rosterTTL <= 0) {
-            debugLog("Scene roster TTL expired, clearing roster.");
-            newState.sceneRoster.clear();
-        }
+    let rosterCleared = false;
+
+    if (expiredMembers.length > 0) {
+        rosterCleared = true;
+        debugLog(`Scene roster TTL expired for ${expiredMembers.join(', ')}, removing from roster.`);
     }
 
-    if (newState.outfitRoster.size > 0) {
-        newState.outfitTTL--;
+    if (advanceRosterTTL && newState.outfitRoster.size > 0 && Number.isFinite(newState.outfitTTL)) {
+        newState.outfitTTL -= 1;
         if (newState.outfitTTL <= 0) {
             const expired = Array.from(newState.outfitRoster.keys());
-            debugLog("Outfit roster TTL expired, clearing tracked outfits:", expired.join(', '));
+            if (expired.length) {
+                debugLog("Outfit roster TTL expired, clearing tracked outfits:", expired.join(', '));
+            } else {
+                debugLog("Outfit roster TTL expired, clearing tracked outfits.");
+            }
             newState.outfitRoster.clear();
             const cache = ensureCharacterOutfitCache(state);
             expired.forEach(key => cache.delete(key));
         }
+        newState.outfitTTL = Math.max(0, newState.outfitTTL);
     }
 
-    state.perMessageStates.set(bufKey, newState);
-    state.perMessageBuffers.set(bufKey, '');
-    trackMessageKey(bufKey);
+    state.perMessageStates.set(normalizedKey, newState);
+    state.perMessageBuffers.set(normalizedKey, '');
+    trackMessageKey(normalizedKey);
 
-    return newState;
+    return { state: newState, initialized: true, rosterCleared, key: normalizedKey };
 }
+
+__testables.createMessageState = createMessageState;
+__testables.resolveMessageRoleFromArgs = resolveMessageRoleFromArgs;
+__testables.findAssistantMessageBeforeIndex = findAssistantMessageBeforeIndex;
+__testables.resolveAssistantHistoryMessage = resolveAssistantHistoryMessage;
+__testables.findChatMessageById = findChatMessageById;
+__testables.findChatMessageByKey = findChatMessageByKey;
+__testables.resolveHistoryTargetMessage = resolveHistoryTargetMessage;
 
 function remapMessageKey(oldKey, newKey) {
     if (!oldKey || !newKey || oldKey === newKey) return;
+
+    const normalizedOld = normalizeMessageKey(oldKey);
+    const normalizedNew = normalizeMessageKey(newKey);
 
     const moveEntry = (map) => {
         if (!(map instanceof Map) || !map.has(oldKey)) return;
@@ -5842,9 +10372,23 @@ function remapMessageKey(oldKey, newKey) {
     moveEntry(state.perMessageBuffers);
     moveEntry(state.perMessageStates);
     moveEntry(state.messageStats);
+    moveEntry(state.messageMatches);
 
     if (state.topSceneRanking instanceof Map) {
         moveEntry(state.topSceneRanking);
+    }
+
+    if (state.topSceneRankingUpdatedAt instanceof Map) {
+        if (normalizedOld && state.topSceneRankingUpdatedAt.has(normalizedOld)) {
+            const value = state.topSceneRankingUpdatedAt.get(normalizedOld);
+            state.topSceneRankingUpdatedAt.delete(normalizedOld);
+            const targetKey = normalizedNew || newKey;
+            if (targetKey) {
+                state.topSceneRankingUpdatedAt.set(targetKey, value);
+            }
+        } else {
+            moveEntry(state.topSceneRankingUpdatedAt);
+        }
     }
 
     if (state.latestTopRanking?.bufKey === oldKey) {
@@ -5858,33 +10402,201 @@ function remapMessageKey(oldKey, newKey) {
 
     replaceTrackedMessageKey(oldKey, newKey);
 
+    const remapEvents = (events) => {
+        if (!Array.isArray(events) || !normalizedOld || !normalizedNew) {
+            return;
+        }
+        events.forEach((event) => {
+            if (!event || typeof event !== "object") {
+                return;
+            }
+            if (normalizeMessageKey(event.messageKey) === normalizedOld) {
+                event.messageKey = normalizedNew;
+            }
+        });
+    };
+
+    remapEvents(state.recentDecisionEvents);
+    if (Array.isArray(state.lastTesterReport?.events)) {
+        remapEvents(state.lastTesterReport.events);
+    }
+    const session = ensureSessionData();
+    if (session && Array.isArray(session.recentDecisionEvents)) {
+        remapEvents(session.recentDecisionEvents);
+    }
+
     debugLog(`Remapped message data from ${oldKey} to ${newKey}.`);
 }
 
 const handleGenerationStart = (...args) => {
+    let messageRole = resolveMessageRoleFromArgs(args);
+    if (messageRole && messageRole !== "assistant") {
+        debugLog(`Skipping generation start for ${messageRole} message.`, args);
+        state.currentGenerationKey = null;
+        return;
+    }
+
     let bufKey = null;
-    for (const arg of args) {
-        if (typeof arg === 'string' && arg.trim().length) {
-            bufKey = arg.trim();
-            break;
+    let locatedMessage = null;
+
+    const adoptReference = (value) => {
+        if (value == null) {
+            return;
         }
-        if (typeof arg === 'number' && Number.isFinite(arg)) {
-            bufKey = `m${arg}`;
-            break;
+        const reference = parseMessageReference(value);
+        if (!bufKey && reference.key) {
+            bufKey = reference.key;
         }
-        if (arg && typeof arg === 'object') {
-            if (typeof arg.generationType === 'string' && arg.generationType.trim().length) {
-                bufKey = arg.generationType.trim();
-                break;
+        if (!locatedMessage) {
+            if (Number.isFinite(reference.messageId)) {
+                locatedMessage = findChatMessageById(reference.messageId);
             }
-            if (typeof arg.messageId === 'number' && Number.isFinite(arg.messageId)) {
-                bufKey = `m${arg.messageId}`;
-                break;
+            if (!locatedMessage && reference.key) {
+                locatedMessage = findChatMessageByKey(reference.key);
             }
-            if (typeof arg.key === 'string' && arg.key.trim().length) {
-                bufKey = arg.key.trim();
-                break;
+        }
+    };
+
+    const visited = new Set();
+    const queue = Array.isArray(args) ? [...args] : [];
+    while (queue.length > 0) {
+        const value = queue.shift();
+        if (typeof value === "string" || typeof value === "number") {
+            adoptReference(value);
+            continue;
+        }
+        if (typeof value === "boolean" || value == null) {
+            continue;
+        }
+        if (Array.isArray(value)) {
+            queue.push(...value);
+            continue;
+        }
+        if (typeof value !== "object") {
+            continue;
+        }
+        if (visited.has(value)) {
+            continue;
+        }
+        visited.add(value);
+
+        adoptReference(value);
+
+        if (typeof value.message === "object" && value.message !== null) {
+            queue.push(value.message);
+        }
+        if (Array.isArray(value.messages) && value.messages.length > 0) {
+            queue.push(...value.messages);
+        }
+        if (typeof value.detail === "object" && value.detail !== null) {
+            queue.push(value.detail);
+            if (typeof value.detail.message === "object" && value.detail.message !== null) {
+                queue.push(value.detail.message);
             }
+            if (Array.isArray(value.detail.messages) && value.detail.messages.length > 0) {
+                queue.push(...value.detail.messages);
+            }
+        }
+    }
+
+    const locatedRole = locatedMessage ? resolveMessageRoleFromArgs([locatedMessage]) : null;
+    if (locatedRole && locatedRole !== "assistant") {
+        debugLog(`Skipping generation start for ${locatedRole} chat message.`, args);
+        state.currentGenerationKey = null;
+        return;
+    }
+    if (!messageRole && locatedRole) {
+        messageRole = locatedRole;
+    }
+
+    const isUserInitiated = (() => {
+        const queue = Array.isArray(args) ? [...args] : [];
+        const visited = new Set();
+        while (queue.length) {
+            const value = queue.shift();
+            if (value == null) {
+                continue;
+            }
+            if (typeof value === "string") {
+                const lowered = value.trim().toLowerCase();
+                if (["user", "input", "manual", "manual_input", "human", "player"].includes(lowered)) {
+                    return true;
+                }
+                continue;
+            }
+            if (typeof value === "number" || typeof value === "boolean") {
+                continue;
+            }
+            if (typeof value !== "object") {
+                continue;
+            }
+            if (visited.has(value)) {
+                continue;
+            }
+            visited.add(value);
+            if (value.is_user === true || value.isUser === true) {
+                return true;
+            }
+            const role = typeof value.role === "string" ? value.role.trim().toLowerCase() : null;
+            if (role === "user" || role === "player" || role === "human") {
+                return true;
+            }
+            const author = typeof value.author === "string" ? value.author.trim().toLowerCase() : null;
+            if (author === "user" || author === "player" || author === "human") {
+                return true;
+            }
+            const sender = typeof value.sender === "string" ? value.sender.trim().toLowerCase() : null;
+            if (sender === "user" || sender === "player" || sender === "human") {
+                return true;
+            }
+            const source = typeof value.source === "string" ? value.source.trim().toLowerCase() : null;
+            if (source === "user" || source === "player" || source === "human") {
+                return true;
+            }
+            const type = typeof value.type === "string" ? value.type.trim().toLowerCase() : null;
+            if (type === "user" || type === "input" || type === "manual" || type === "human") {
+                return true;
+            }
+            const generationType = typeof value.generationType === "string"
+                ? value.generationType.trim().toLowerCase()
+                : null;
+            if (generationType === "user" || generationType === "input" || generationType === "manual") {
+                return true;
+            }
+            if (typeof value.message === "object" && value.message !== null) {
+                queue.push(value.message);
+            }
+            if (Array.isArray(value.messages)) {
+                queue.push(...value.messages);
+            }
+            if (typeof value.detail === "object" && value.detail !== null) {
+                queue.push(value.detail);
+                if (typeof value.detail.message === "object" && value.detail.message !== null) {
+                    queue.push(value.detail.message);
+                }
+                if (Array.isArray(value.detail.messages)) {
+                    queue.push(...value.detail.messages);
+                }
+            }
+        }
+        return false;
+    })();
+
+    if (isUserInitiated) {
+        debugLog("Skipping generation start for user-authored event.", args);
+        return;
+    }
+
+    if (!bufKey && locatedMessage) {
+        const fallbackKey = locatedMessage.message_key
+            || locatedMessage.messageKey
+            || locatedMessage.key
+            || (Number.isFinite(locatedMessage.mesId) ? `m${locatedMessage.mesId}` : null)
+            || (Number.isFinite(locatedMessage.id) ? `m${locatedMessage.id}` : null);
+        if (fallbackKey) {
+            const normalizedFallback = normalizeMessageKey(fallbackKey) || fallbackKey;
+            bufKey = normalizedFallback;
+            debugLog(`Adopted ${normalizedFallback} from chat context for generation start.`);
         }
     }
 
@@ -5892,18 +10604,35 @@ const handleGenerationStart = (...args) => {
         bufKey = 'live';
     }
 
-    state.currentGenerationKey = bufKey;
+    const normalizedKey = normalizeMessageKey(bufKey) || bufKey;
+
+    state.currentGenerationKey = normalizedKey;
     debugLog(`Generation started for ${bufKey}, resetting state.`);
     state.focusLockNotice = createFocusLockNotice();
 
     const profile = getActiveProfile();
     if (profile) {
-        createMessageState(profile, bufKey);
+        const { state: msgState, rosterCleared } = createMessageState(profile, normalizedKey, { messageRole });
+        if (rosterCleared && msgState) {
+            applySceneRosterUpdate({
+                key: normalizedKey,
+                messageId: extractMessageIdFromKey(normalizedKey),
+                roster: Array.from(msgState.sceneRoster || []),
+                turnsByMember: cloneRosterTurns(msgState.rosterTurns),
+                turnsRemaining: msgState.defaultRosterTTL,
+                updatedAt: Date.now(),
+            });
+            requestScenePanelRender("roster-prime", { immediate: true });
+        }
     } else {
-        state.perMessageStates.delete(bufKey);
-        state.perMessageBuffers.set(bufKey, '');
+        state.perMessageStates.delete(normalizedKey);
+        state.perMessageBuffers.set(normalizedKey, '');
     }
+    maybeAutoExpandScenePanel("stream");
 };
+
+__testables.handleGenerationStart = handleGenerationStart;
+__testables.restoreLatestSceneOutcome = restoreLatestSceneOutcome;
 
 const handleStream = (...args) => {
     try {
@@ -5925,6 +10654,62 @@ const handleStream = (...args) => {
             return;
         }
 
+        const messageRole = resolveMessageRoleFromArgs(args);
+        if (messageRole && messageRole !== "assistant") {
+            return;
+        }
+
+        if (!state.currentGenerationKey) {
+            let fallbackKey = null;
+            let fallbackReference = null;
+            for (const arg of args) {
+                const reference = parseMessageReference(arg);
+                const { key } = reference;
+                if (key) {
+                    fallbackKey = key;
+                    fallbackReference = reference;
+                    break;
+                }
+            }
+            if (fallbackKey) {
+                const normalizedFallbackCandidate = normalizeMessageKey(fallbackKey) || fallbackKey;
+                if (!isLikelyMessageKey(normalizedFallbackCandidate)) {
+                    debugLog(`Ignoring ${normalizedFallbackCandidate} from token payload due to invalid message key format.`);
+                    state.currentGenerationKey = null;
+                } else {
+                    const normalizedFallback = normalizedFallbackCandidate;
+                    let resolvedMessage = null;
+                    const resolvedId = Number.isFinite(fallbackReference?.messageId)
+                        ? fallbackReference.messageId
+                        : extractMessageIdFromKey(normalizedFallback);
+                    if (Number.isFinite(resolvedId)) {
+                        resolvedMessage = findChatMessageById(resolvedId);
+                    }
+                    if (!resolvedMessage) {
+                        resolvedMessage = findChatMessageByKey(normalizedFallback);
+                    }
+                    if (!resolvedMessage && Number.isFinite(resolvedId)) {
+                        const { chat } = getContext();
+                        if (Array.isArray(chat)) {
+                            resolvedMessage = chat.find((message) => Number.isFinite(message?.mesId) && message.mesId === resolvedId) || null;
+                        }
+                    }
+
+                    let locatedRole = resolvedMessage ? resolveMessageRoleFromArgs([resolvedMessage]) : null;
+                    if (!locatedRole && resolvedMessage?.is_user) {
+                        locatedRole = "user";
+                    }
+
+                    if (locatedRole && locatedRole !== "assistant") {
+                        debugLog(`Skipping stream tracking for ${normalizedFallback} due to ${locatedRole} role.`);
+                    } else {
+                        state.currentGenerationKey = normalizedFallback;
+                        debugLog(`Adopted ${normalizedFallback} as stream key from token payload.`);
+                    }
+                }
+            }
+        }
+
         const profile = getActiveProfile();
         if (!profile) return;
 
@@ -5939,13 +10724,30 @@ const handleStream = (...args) => {
 
         let msgState = state.perMessageStates.get(bufKey);
         if (!msgState) {
-            msgState = createMessageState(profile, bufKey);
+            const { state: createdState, rosterCleared } = createMessageState(profile, bufKey, { messageRole: messageRole || "assistant" });
+            msgState = createdState;
+            if (rosterCleared && msgState) {
+                const normalized = normalizeMessageKey(bufKey) || bufKey;
+                applySceneRosterUpdate({
+                    key: normalized,
+                    messageId: extractMessageIdFromKey(normalized),
+                    roster: Array.from(msgState.sceneRoster || []),
+                    turnsByMember: cloneRosterTurns(msgState.rosterTurns),
+                    turnsRemaining: msgState.defaultRosterTTL,
+                    updatedAt: Date.now(),
+                });
+                requestScenePanelRender("roster-prime", { immediate: true });
+            }
         }
         if (!msgState) return;
 
         if (msgState.vetoed) return;
 
         const prev = state.perMessageBuffers.get(bufKey) || "";
+        const previousOffset = Number.isFinite(msgState.bufferOffset) ? msgState.bufferOffset : 0;
+        const previousProcessedLength = Number.isFinite(msgState.processedLength)
+            ? msgState.processedLength
+            : previousOffset + prev.length;
         const normalizedToken = normalizeStreamText(tokenText);
         const appended = prev + normalizedToken;
         const maxBuffer = resolveMaxBufferChars(profile);
@@ -5955,6 +10757,8 @@ const handleStream = (...args) => {
         state.perMessageBuffers.set(bufKey, combined);
 
         const bufferOffset = Number.isFinite(msgState.bufferOffset) ? msgState.bufferOffset : 0;
+        const deltaAbsoluteStart = Math.max(previousProcessedLength, bufferOffset);
+        const startIndex = Math.max(0, deltaAbsoluteStart - bufferOffset);
         const newestAbsoluteIndex = combined.length > 0 ? bufferOffset + combined.length - 1 : bufferOffset;
         const lastProcessedIndex = Number.isFinite(msgState.lastAcceptedIndex) ? msgState.lastAcceptedIndex : -1;
 
@@ -5963,7 +10767,17 @@ const handleStream = (...args) => {
         }
 
         const rosterSet = msgState?.sceneRoster instanceof Set ? msgState.sceneRoster : null;
-        const analytics = updateMessageAnalytics(bufKey, combined, { rosterSet, assumeNormalized: true });
+        const analytics = updateMessageAnalytics(bufKey, combined, {
+            rosterSet,
+            assumeNormalized: true,
+            bufferOffset,
+            incremental: true,
+            startIndex,
+            previousProcessedAbsolute: Number.isFinite(previousProcessedLength)
+                ? previousProcessedLength - 1
+                : null,
+            messageState: msgState,
+        });
 
         let minIndexRelative = null;
         if (lastProcessedIndex >= bufferOffset) {
@@ -5997,30 +10811,47 @@ const handleStream = (...args) => {
             const now = Date.now();
             const suppressMs = profile.repeatSuppressMs;
 
-            const absoluteIndex = Number.isFinite(bestMatch.matchIndex)
-                ? bufferOffset + bestMatch.matchIndex
+            const matchLength = Number.isFinite(bestMatch.matchLength) && bestMatch.matchLength > 0
+                ? Math.floor(bestMatch.matchLength)
+                : 1;
+            const matchEndRelative = Number.isFinite(bestMatch.matchIndex)
+                ? bestMatch.matchIndex + matchLength - 1
+                : null;
+            const absoluteIndex = Number.isFinite(matchEndRelative)
+                ? bufferOffset + matchEndRelative
                 : newestAbsoluteIndex;
             msgState.lastAcceptedIndex = absoluteIndex;
             msgState.processedLength = Math.max(msgState.processedLength || 0, absoluteIndex + 1);
 
             if (profile.enableSceneRoster) {
-                msgState.sceneRoster.add(matchedName.toLowerCase());
-                msgState.rosterTTL = profile.sceneRosterTTL;
-                msgState.outfitTTL = profile.sceneRosterTTL;
+                const normalizedName = normalizeRosterKey(matchedName);
+                if (normalizedName) {
+                    msgState.sceneRoster.add(normalizedName);
+                    if (!(msgState.rosterTurns instanceof Map)) {
+                        msgState.rosterTurns = new Map();
+                    }
+                    const resolvedTTL = sanitizeRosterTurnValue(msgState.defaultRosterTTL ?? profile.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL);
+                    if (resolvedTTL != null) {
+                        msgState.rosterTurns.set(normalizedName, resolvedTTL);
+                    }
+                }
+                msgState.outfitTTL = sanitizeRosterTurnValue(profile?.sceneRosterTTL ?? PROFILE_DEFAULTS.sceneRosterTTL);
             }
             if (matchKind !== 'pronoun') {
                 confirmMessageSubject(msgState, matchedName);
             }
 
             if (msgState.lastAcceptedName?.toLowerCase() === matchedName.toLowerCase() && (now - msgState.lastAcceptedTs < suppressMs)) {
-                recordDecisionEvent({
-                    type: 'skipped',
-                    name: matchedName,
-                    matchKind,
-                    reason: 'repeat-suppression',
-                    charIndex: absoluteIndex,
-                    timestamp: now,
-                });
+                if (matchKind !== 'pronoun') {
+                    recordDecisionEvent({
+                        type: 'skipped',
+                        name: matchedName,
+                        matchKind,
+                        reason: 'repeat-suppression',
+                        charIndex: absoluteIndex,
+                        timestamp: now,
+                    });
+                }
                 return;
             }
 
@@ -6036,6 +10867,387 @@ const handleStream = (...args) => {
         }
     } catch (err) { console.error(`${logPrefix} stream handler error:`, err); }
 };
+
+function resolveChatLog(chatOverride = null) {
+    if (Array.isArray(chatOverride)) {
+        return chatOverride;
+    }
+    let ctx = null;
+    if (typeof getContext === "function") {
+        ctx = getContext();
+    } else if (typeof window !== "undefined" && window.SillyTavern && typeof window.SillyTavern.getContext === "function") {
+        ctx = window.SillyTavern.getContext();
+    }
+    if (!ctx || !Array.isArray(ctx.chat)) {
+        return null;
+    }
+    return ctx.chat;
+}
+
+function findAssistantMessageBeforeIndex(index, chatOverride = null) {
+    const chat = resolveChatLog(chatOverride);
+    if (!Array.isArray(chat) || chat.length === 0) {
+        return null;
+    }
+    const startIndex = Number.isFinite(index) ? Math.min(index, chat.length - 1) : chat.length - 1;
+    if (startIndex < 0) {
+        return null;
+    }
+    for (let i = startIndex; i >= 0; i -= 1) {
+        const candidate = chat[i];
+        if (isAssistantLikeMessage(candidate)) {
+            return candidate;
+        }
+    }
+    return null;
+}
+
+function resolveAssistantHistoryMessage({ chat = null, candidate = null, beforeIndex = null } = {}) {
+    const chatLog = resolveChatLog(chat);
+    if (!Array.isArray(chatLog) || chatLog.length === 0) {
+        return null;
+    }
+    if (candidate && isAssistantLikeMessage(candidate) && chatLog.includes(candidate)) {
+        return candidate;
+    }
+    let searchIndex = Number.isFinite(beforeIndex) ? beforeIndex : null;
+    if (!Number.isFinite(searchIndex) && candidate) {
+        const candidateIndex = chatLog.indexOf(candidate);
+        if (candidateIndex >= 0) {
+            searchIndex = candidateIndex - 1;
+        }
+    }
+    if (!Number.isFinite(searchIndex)) {
+        searchIndex = chatLog.length - 1;
+    }
+    if (searchIndex < 0) {
+        return null;
+    }
+    return findAssistantMessageBeforeIndex(searchIndex, chatLog);
+}
+
+function getLatestStoredSceneTimestamp() {
+    try {
+        let ctx = null;
+        if (typeof getContext === "function") {
+            ctx = getContext();
+        } else if (typeof window !== "undefined" && window.SillyTavern && typeof window.SillyTavern.getContext === "function") {
+            ctx = window.SillyTavern.getContext();
+        }
+        const chatLog = ctx?.chat;
+        if (!Array.isArray(chatLog) || chatLog.length === 0) {
+            return null;
+        }
+        const latestAssistant = findAssistantMessageBeforeIndex(chatLog.length - 1);
+        if (!latestAssistant) {
+            return null;
+        }
+        const stored = getStoredSceneOutcome(latestAssistant);
+        if (Number.isFinite(stored?.updatedAt)) {
+            return stored.updatedAt;
+        }
+    } catch (error) {
+        debugLog("Failed to resolve latest stored scene timestamp.", error);
+    }
+    return null;
+}
+
+function restoreLatestSceneOutcome({ immediateRender = true, preserveStateOnFailure = false } = {}) {
+    try {
+        const chatLog = resolveChatLog();
+        if (!Array.isArray(chatLog) || chatLog.length === 0) {
+            if (!preserveStateOnFailure) {
+                resetSceneState();
+                replaceLiveTesterOutputs([], { roster: [], preprocessedText: "" });
+            }
+            if (immediateRender) {
+                requestScenePanelRender("history-reset", { immediate: true });
+            }
+            return false;
+        }
+        const latestAssistant = resolveAssistantHistoryMessage({ chat: chatLog });
+        if (!latestAssistant) {
+            if (!preserveStateOnFailure) {
+                resetSceneState();
+                replaceLiveTesterOutputs([], { roster: [], preprocessedText: "" });
+            }
+            if (immediateRender) {
+                requestScenePanelRender("history-reset", { immediate: true });
+            }
+            return false;
+        }
+        return restoreSceneOutcomeForMessage(latestAssistant, {
+            immediateRender,
+            preserveStateOnFailure,
+        });
+    } catch (error) {
+        console.warn(`${logPrefix} Failed to restore latest scene outcome:`, error);
+        if (!preserveStateOnFailure) {
+            resetSceneState();
+            replaceLiveTesterOutputs([], { roster: [], preprocessedText: "" });
+        }
+        if (immediateRender) {
+            requestScenePanelRender("history-reset", { immediate: true });
+        }
+        return false;
+    }
+}
+
+function resolveHistoryTargetMessage(args) {
+    const chat = resolveChatLog();
+    if (!Array.isArray(chat) || chat.length === 0) {
+        return null;
+    }
+    const values = Array.isArray(args) ? args : [];
+    let target = null;
+    let fallbackIndex = null;
+
+    const captureIndexHint = (index) => {
+        if (!Number.isFinite(index)) {
+            return;
+        }
+        const normalized = Math.max(0, Math.min(index, chat.length - 1));
+        fallbackIndex = normalized;
+    };
+
+    const tryAssign = (message) => {
+        if (!message) {
+            return;
+        }
+        const messageIndex = chat.indexOf(message);
+        if (messageIndex >= 0) {
+            captureIndexHint(messageIndex);
+        }
+        if (!target && !isSystemOrNarratorMessage(message)) {
+            target = message;
+        }
+    };
+
+    values.forEach((arg) => {
+        if (target) {
+            return;
+        }
+        if (typeof arg === "number" && chat[arg]) {
+            captureIndexHint(arg);
+            tryAssign(chat[arg]);
+            return;
+        }
+        if (!arg || typeof arg !== "object") {
+            if (typeof arg === "string") {
+                tryAssign(findChatMessageByKey(arg));
+            }
+            return;
+        }
+        if (Number.isFinite(arg.index) && chat[arg.index]) {
+            captureIndexHint(arg.index);
+            tryAssign(chat[arg.index]);
+        }
+        if (target) {
+            return;
+        }
+        if (Number.isFinite(arg.messageId)) {
+            tryAssign(findChatMessageById(arg.messageId));
+        }
+        if (target) {
+            return;
+        }
+        if (Number.isFinite(arg.mesId)) {
+            tryAssign(findChatMessageById(arg.mesId));
+        }
+        if (target) {
+            return;
+        }
+        if (Number.isFinite(arg.id)) {
+            tryAssign(findChatMessageById(arg.id));
+        }
+        if (target) {
+            return;
+        }
+        if (typeof arg.key === "string") {
+            tryAssign(findChatMessageByKey(arg.key));
+        }
+        if (target) {
+            return;
+        }
+        if (typeof arg.messageKey === "string") {
+            tryAssign(findChatMessageByKey(arg.messageKey));
+        }
+        if (target) {
+            return;
+        }
+        if (typeof arg.bufKey === "string") {
+            tryAssign(findChatMessageByKey(arg.bufKey));
+        }
+        if (target) {
+            return;
+        }
+        if (arg.detail && typeof arg.detail === "object") {
+            const nested = resolveHistoryTargetMessage([arg.detail]);
+            if (nested) {
+                tryAssign(nested);
+            }
+        }
+        if (target) {
+            return;
+        }
+        if (arg.message && typeof arg.message === "object") {
+            const nestedMessage = resolveHistoryTargetMessage([arg.message]);
+            if (nestedMessage) {
+                tryAssign(nestedMessage);
+            }
+        }
+        if (target) {
+            return;
+        }
+        if (Array.isArray(arg.messages) && arg.messages.length) {
+            const nested = resolveHistoryTargetMessage(arg.messages);
+            if (nested) {
+                tryAssign(nested);
+            }
+        }
+    });
+
+    if (!target && values.length === 1 && Array.isArray(values[0])) {
+        return resolveHistoryTargetMessage(values[0]);
+    }
+
+    return resolveAssistantHistoryMessage({
+        chat,
+        candidate: target,
+        beforeIndex: fallbackIndex,
+    });
+}
+
+function hasForceSceneRefreshFlag(value, depth = 0) {
+    if (value == null) {
+        return false;
+    }
+    if (value === true) {
+        return true;
+    }
+    if (typeof value === "string") {
+        const normalized = value.toLowerCase();
+        if (normalized.includes("chat") && (normalized.includes("load") || normalized.includes("switch"))) {
+            return true;
+        }
+        return false;
+    }
+    if (typeof value !== "object") {
+        return false;
+    }
+    if (value.forceSceneRefresh === true || value.forceScenePanelRefresh === true) {
+        return true;
+    }
+    const inspectString = (candidate) => {
+        if (typeof candidate !== "string") {
+            return false;
+        }
+        const normalized = candidate.toLowerCase();
+        return normalized.includes("chat") && (normalized.includes("load") || normalized.includes("switch"));
+    };
+    if (inspectString(value.type) || inspectString(value.reason) || inspectString(value.name)) {
+        return true;
+    }
+    if (depth < 3) {
+        if (Array.isArray(value) && value.some((entry) => hasForceSceneRefreshFlag(entry, depth + 1))) {
+            return true;
+        }
+        const nestedKeys = ["detail", "payload", "data", "args", "event", "value"];
+        if (nestedKeys.some((key) => hasForceSceneRefreshFlag(value[key], depth + 1))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function shouldForceSceneRefresh(args = []) {
+    return args.some((arg) => hasForceSceneRefreshFlag(arg));
+}
+
+const handleChatChanged = (...args) => {
+    try {
+        const forceRefresh = shouldForceSceneRefresh(args);
+        let ctx = null;
+        if (typeof getContext === "function") {
+            ctx = getContext();
+        } else if (typeof window !== "undefined" && window.SillyTavern && typeof window.SillyTavern.getContext === "function") {
+            ctx = window.SillyTavern.getContext();
+        }
+        const chatLog = ctx?.chat;
+        const latestAssistant = Array.isArray(chatLog) && chatLog.length
+            ? findAssistantMessageBeforeIndex(chatLog.length - 1)
+            : null;
+
+        if (!forceRefresh) {
+            const latestKey = latestAssistant ? normalizeMessageKey(`m${latestAssistant.mesId}`) : null;
+            const latestSwipe = Number.isFinite(latestAssistant?.swipe_id) ? latestAssistant.swipe_id : null;
+            const latestDigest = extractSceneMessageDigest(latestAssistant);
+            const currentScene = typeof getCurrentSceneSnapshot === "function" ? getCurrentSceneSnapshot() : {};
+            const currentKey = normalizeMessageKey(currentScene?.key);
+            const sessionKey = normalizeMessageKey(ensureSessionData()?.lastMessageKey);
+            const lastSwipe = Number.isFinite(state.lastSceneSwipeId) ? state.lastSceneSwipeId : null;
+            const lastDigest = state.lastSceneDigest ?? null;
+
+            if (!latestAssistant && !currentKey) {
+                return;
+            }
+
+            if (latestKey && (latestKey === currentKey || latestKey === sessionKey)) {
+                const swipeMatches = latestSwipe == null || lastSwipe == null || latestSwipe === lastSwipe;
+                const digestMatches = latestDigest === lastDigest;
+                if (swipeMatches && digestMatches) {
+                    return;
+                }
+            }
+        }
+
+        resetGlobalState({ immediateRender: false });
+        if (latestAssistant) {
+            const restored = restoreSceneOutcomeForMessage(latestAssistant, { immediateRender: true });
+            if (!restored) {
+                restoreLatestSceneOutcome({ immediateRender: true });
+            }
+        } else {
+            restoreLatestSceneOutcome({ immediateRender: true });
+        }
+    } catch (error) {
+        console.warn(`${logPrefix} Failed to reconcile chat change:`, error);
+        resetGlobalState({ immediateRender: false });
+        restoreLatestSceneOutcome({ immediateRender: true });
+    }
+};
+
+const handleHistoryChange = (...args) => {
+    try {
+        const target = resolveHistoryTargetMessage(args);
+        if (target) {
+            restoreSceneOutcomeForMessage(target);
+            return;
+        }
+
+        let ctx = null;
+        if (typeof getContext === "function") {
+            ctx = getContext();
+        } else if (typeof window !== "undefined" && window.SillyTavern && typeof window.SillyTavern.getContext === "function") {
+            ctx = window.SillyTavern.getContext();
+        }
+        const chatLog = ctx?.chat;
+        const hasAssistantMessages = Array.isArray(chatLog)
+            && chatLog.some((message) => isAssistantLikeMessage(message));
+
+        if (!hasAssistantMessages) {
+            resetSceneState();
+            replaceLiveTesterOutputs([], { roster: [], preprocessedText: "" });
+            requestScenePanelRender("history-reset", { immediate: true });
+        } else {
+            debugLog("History change did not resolve to an assistant message; preserving scene panel state.", args);
+        }
+    } catch (error) {
+        console.warn(`${logPrefix} Failed to reconcile history change:`, error);
+    }
+};
+
+__testables.handleHistoryChange = handleHistoryChange;
 
 const handleMessageRendered = (...args) => {
     const tempKey = state.currentGenerationKey;
@@ -6073,13 +11285,46 @@ const handleMessageRendered = (...args) => {
         return;
     }
 
+    let renderedMessage = null;
+    if (Number.isFinite(resolvedId)) {
+        renderedMessage = findChatMessageById(resolvedId);
+    }
+    if (!renderedMessage && finalKey) {
+        renderedMessage = findChatMessageByKey(finalKey);
+    }
+
+    if (renderedMessage?.is_user || isSystemOrNarratorMessage(renderedMessage)) {
+        debugLog(`Skipping scene panel sync for non-assistant message ${finalKey}.`);
+        state.currentGenerationKey = null;
+        return;
+    }
+
+    const hasTrackedState = Boolean(
+        (state.perMessageBuffers instanceof Map && state.perMessageBuffers.has(finalKey))
+        || (state.perMessageStates instanceof Map && state.perMessageStates.has(finalKey))
+        || (state.messageStats instanceof Map && state.messageStats.has(finalKey))
+    );
+
+    if (!renderedMessage && !hasTrackedState) {
+        debugLog(`Skipping scene panel sync for ${finalKey}; no tracked generation state found.`, args);
+        state.currentGenerationKey = null;
+        return;
+    }
+
     debugLog(`Message ${finalKey} rendered, calculating final stats from buffer.`);
     calculateFinalMessageStats({ key: finalKey, messageId: resolvedId });
+    captureSceneOutcomeForMessage({ key: finalKey, messageId: resolvedId });
     pruneMessageCaches();
     state.currentGenerationKey = null;
+    requestScenePanelRender("message-rendered", { immediate: true });
 };
 
-const resetGlobalState = () => {
+const resetGlobalState = ({ immediateRender = true } = {}) => {
+    resetSceneState();
+    clearLiveTesterOutputs();
+    if (immediateRender) {
+        requestScenePanelRender("global-reset", { immediate: true });
+    }
     if (state.statusTimer) {
         clearTimeout(state.statusTimer);
         state.statusTimer = null;
@@ -6104,15 +11349,23 @@ const resetGlobalState = () => {
         perMessageStates: new Map(),
         messageStats: new Map(),
         topSceneRanking: new Map(),
+        topSceneRankingUpdatedAt: new Map(),
         latestTopRanking: { bufKey: null, ranking: [], fullRanking: [], updatedAt: Date.now() },
         currentGenerationKey: null,
         messageKeyQueue: [],
         draftMappingIds: new Set(),
         draftPatternIds: new Set(),
         focusLockNotice: createFocusLockNotice(),
+        lastSceneSwipeId: null,
+        lastSceneDigest: null,
     });
     clearSessionTopCharacters();
+    if (!immediateRender) {
+        requestScenePanelRender("global-reset", { immediate: true });
+    }
 };
+
+__testables.resetGlobalState = resetGlobalState;
 
 export {
     resolveOutfitForMatch,
@@ -6124,46 +11377,147 @@ export {
     getVerbInflections,
     getWinner,
     findBestMatch,
+    rankSceneCharacters,
+    updateMessageAnalytics,
     adjustWindowForTrim,
     simulateTesterStream,
     buildVariantFolderPath,
     handleStream,
+    remapMessageKey,
+    restoreSceneOutcomeForMessage,
+    collectScenePanelState,
+    computeAnalyticsUpdatedAt,
+    __testables,
 };
+
+async function mountScenePanelTemplate() {
+    try {
+        const $existingPanel = $("#cs-scene-panel").first();
+        if ($existingPanel.length > 0) {
+            setScenePanelContainer($existingPanel);
+            setScenePanelContent($existingPanel.find('[data-scene-panel="content"]'));
+            setSceneCollapseToggle($existingPanel.find('[data-scene-panel="collapse-toggle"]'));
+            setSceneSectionsContainer($existingPanel.find('[data-scene-panel="sections"]'));
+            setSceneToolbar($existingPanel.find('[data-scene-panel="toolbar"]'));
+            setSceneRosterList($existingPanel.find('[data-scene-panel="roster-list"]'));
+            setSceneRosterSection($existingPanel.find('[data-scene-panel="roster"]'));
+            setSceneActiveCards($existingPanel.find('[data-scene-panel="active-cards"]'));
+            setSceneActiveSection($existingPanel.find('[data-scene-panel="active-characters"]'));
+            setSceneLiveLog($existingPanel.find('[data-scene-panel="log-viewport"]'));
+            setSceneLiveLogSection($existingPanel.find('[data-scene-panel="live-log"]'));
+            setSceneCoverageSection($existingPanel.find('[data-scene-panel="coverage"]'));
+            setSceneCoveragePronouns($existingPanel.find('[data-scene-panel="coverage-pronouns"]'));
+            setSceneCoverageAttribution($existingPanel.find('[data-scene-panel="coverage-attribution"]'));
+            setSceneCoverageAction($existingPanel.find('[data-scene-panel="coverage-action"]'));
+            setSceneFooterButton($existingPanel.find('[data-scene-panel="open-settings"]'));
+            setSceneStatusText($existingPanel.find('[data-scene-panel="status-text"]'));
+            initializeScenePanelUI();
+            requestScenePanelRender("mount", { immediate: true });
+            return;
+        }
+
+        let templateHtml;
+        try {
+            templateHtml = await renderExtensionTemplateAsync(extensionTemplateNamespace, "ui/templates/scenePanel");
+        } catch (primaryError) {
+            console.warn(`${logPrefix} Scene panel template missing at ui/templates/scenePanel.html, attempting fallback.`, primaryError);
+            try {
+                templateHtml = await renderExtensionTemplateAsync(extensionTemplateNamespace, "src/ui/templates/scenePanel");
+            } catch (fallbackError) {
+                console.error(`${logPrefix} Failed to load scene panel template from both primary and fallback locations.`, fallbackError);
+                return;
+            }
+        }
+
+        if (!templateHtml) {
+            console.warn(`${logPrefix} Scene panel template did not return any markup.`);
+            return;
+        }
+
+        const $fragment = $(templateHtml.trim());
+        const $panel = $fragment.filter("#cs-scene-panel").length > 0
+            ? $fragment.filter("#cs-scene-panel").first()
+            : $fragment.find("#cs-scene-panel").first();
+
+        if ($panel.length === 0) {
+            console.warn(`${logPrefix} Scene panel template is missing the #cs-scene-panel root node.`);
+            return;
+        }
+
+        const candidateSelectors = ["#sheld", "#st-chat-column", "#chat-column", "#st-chat"];
+        let $chatColumn = $();
+        for (const selector of candidateSelectors) {
+            $chatColumn = $(selector).first();
+            if ($chatColumn.length > 0) {
+                break;
+            }
+        }
+
+        if ($chatColumn.length > 0) {
+            $panel.insertAfter($chatColumn);
+        } else {
+            const workspaceSelectors = ["#st-workspace", "#st-container"];
+            let $workspace = $();
+            for (const selector of workspaceSelectors) {
+                $workspace = $(selector).first();
+                if ($workspace.length > 0) {
+                    break;
+                }
+            }
+
+            if ($workspace.length === 0) {
+                $workspace = $("body");
+            }
+
+            $workspace.append($panel);
+        }
+
+        setScenePanelContainer($panel);
+        setScenePanelContent($panel.find('[data-scene-panel="content"]'));
+        setSceneCollapseToggle($panel.find('[data-scene-panel="collapse-toggle"]'));
+        setSceneSectionsContainer($panel.find('[data-scene-panel="sections"]'));
+        setSceneToolbar($panel.find('[data-scene-panel="toolbar"]'));
+        setSceneRosterList($panel.find('[data-scene-panel="roster-list"]'));
+        setSceneRosterSection($panel.find('[data-scene-panel="roster"]'));
+        setSceneActiveCards($panel.find('[data-scene-panel="active-cards"]'));
+        setSceneActiveSection($panel.find('[data-scene-panel="active-characters"]'));
+        setSceneLiveLog($panel.find('[data-scene-panel="log-viewport"]'));
+        setSceneLiveLogSection($panel.find('[data-scene-panel="live-log"]'));
+        setSceneCoverageSection($panel.find('[data-scene-panel="coverage"]'));
+        setSceneCoveragePronouns($panel.find('[data-scene-panel="coverage-pronouns"]'));
+        setSceneCoverageAttribution($panel.find('[data-scene-panel="coverage-attribution"]'));
+        setSceneCoverageAction($panel.find('[data-scene-panel="coverage-action"]'));
+        setSceneFooterButton($panel.find('[data-scene-panel="open-settings"]'));
+        setSceneStatusText($panel.find('[data-scene-panel="status-text"]'));
+        initializeScenePanelUI();
+        requestScenePanelRender("mount", { immediate: true });
+    } catch (error) {
+        console.warn(`${logPrefix} Failed to mount scene panel:`, error);
+    }
+}
 
 function load() {
     state.eventHandlers = {};
-    const registered = new Set();
-    const registerHandler = (eventType, handler) => {
-        if (typeof eventType !== 'string' || typeof handler !== 'function' || registered.has(eventType)) {
-            return;
-        }
-        registered.add(eventType);
-        state.eventHandlers[eventType] = handler;
-        eventSource.on(eventType, handler);
-    };
-
-    registerHandler(event_types?.STREAM_TOKEN_RECEIVED, handleStream);
-    registerHandler(event_types?.GENERATION_STARTED, handleGenerationStart);
-
-    const renderEvents = [
-        event_types?.CHARACTER_MESSAGE_RENDERED,
-        event_types?.MESSAGE_RENDERED,
-        event_types?.GENERATION_ENDED,
-        event_types?.STREAM_ENDED,
-        event_types?.STREAM_FINISHED,
-        event_types?.STREAM_COMPLETE,
-    ].filter((evt) => typeof evt === 'string');
-
-    renderEvents.forEach((evt) => registerHandler(evt, handleMessageRendered));
-
-    registerHandler(event_types?.CHAT_CHANGED, resetGlobalState);
+    if (state.integrationHandlers) {
+        unregisterSillyTavernIntegration(state.integrationHandlers);
+        state.integrationHandlers = null;
+    }
+    state.integrationHandlers = registerSillyTavernIntegration({
+        eventSource,
+        eventTypes: event_types,
+        onGenerationStarted: handleGenerationStart,
+        onStreamStarted: handleGenerationStart,
+        onStreamToken: handleStream,
+        onMessageFinished: handleMessageRendered,
+        onChatChanged: handleChatChanged,
+        onHistoryChanged: handleHistoryChange,
+    });
 }
 
 function unload() {
-    if (state.eventHandlers && typeof state.eventHandlers === 'object') {
-        for (const [event, handler] of Object.entries(state.eventHandlers)) {
-            eventSource.off(event, handler);
-        }
+    if (state.integrationHandlers) {
+        unregisterSillyTavernIntegration(state.integrationHandlers, { eventSource });
+        state.integrationHandlers = null;
     }
     resetGlobalState();
 }
@@ -6189,6 +11543,7 @@ function getSettingsObj() {
     
     storeSource[extensionName] = Object.assign({}, structuredClone(DEFAULTS), storeSource[extensionName]);
     storeSource[extensionName].profiles = loadProfiles(storeSource[extensionName].profiles, PROFILE_DEFAULTS);
+    ensureScenePanelSettings(storeSource[extensionName]);
 
     ensureScorePresetStructure(storeSource[extensionName]);
 
@@ -6218,6 +11573,8 @@ if (typeof window !== "undefined" && typeof jQuery === "function") {
             const settingsHtml = await $.get(`${extensionFolderPath}/settings.html`);
             $("#extensions_settings").append(settingsHtml);
 
+            await mountScenePanelTemplate();
+
             const buildMeta = await fetchBuildMetadata();
             renderBuildMetadata(buildMeta);
 
@@ -6228,6 +11585,7 @@ if (typeof window !== "undefined" && typeof jQuery === "function") {
             wireUI();
             registerCommands();
             load();
+            restoreLatestSceneOutcome({ immediateRender: true });
 
             window[`__${extensionName}_unload`] = unload;
             console.log(`${logPrefix} ${buildMeta?.label || 'dev build'} loaded successfully.`);

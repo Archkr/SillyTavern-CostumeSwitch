@@ -4,7 +4,7 @@ Costume Switcher is the companion piece to Lenny’s **Character Expressions** e
 
 Under the hood the extension listens to streaming output from your model, scores every character mention it finds, and immediately updates the displayed costume to match the active speaker. It ships with powerful tooling, scene awareness, and a fully redesigned configuration UI so you can understand *why* a switch happened and tune the behaviour to fit any story.
 
-> **New to the Switcher family?** Start here, then hop over to the Character Expressions README. Together they form a best-friends duo: Expressions handles nuanced emotions, Costume Switcher handles wardrobe and character changes.
+> **New to Costume Switcher?** Start here, then hop over to the Character Expressions README. Together they form a best-friends duo: Expressions handles nuanced emotions, Costume Switcher handles wardrobe changes.
 
 ---
 
@@ -15,8 +15,8 @@ Under the hood the extension listens to streaming output from your model, scores
 3. [Installation](#installation)
 4. [Architecture Overview](#architecture-overview)
 5. [Custom Detection Engines](#custom-detection-engines)
-    1. [Main Detection Engine (v3)](#main-detection-engine-v3)
-    2. [Outfit Detection Engine (v1)](#outfit-detection-engine-v1)
+    1. [Main Detection Engine (v4)](#main-detection-engine-v4)
+    2. [Outfit Detection Engine (v2)](#outfit-detection-engine-v2)
 6. [Getting Started in Five Minutes](#getting-started-in-five-minutes)
 7. [Tour of the Settings UI](#tour-of-the-settings-ui)
     1. [Header & Master Toggle](#header--master-toggle)
@@ -24,9 +24,10 @@ Under the hood the extension listens to streaming output from your model, scores
     3. [Character Patterns & Filters](#character-patterns--filters)
     4. [Presets & Focus](#presets--focus)
     5. [Detection Strategy](#detection-strategy)
+        1. [Regex Preprocessor quick guide](#regex-preprocessor-quick-guide)
+        2. [Fuzzy name matching quick guide](#fuzzy-name-matching-quick-guide)
     6. [Performance & Bias](#performance--bias)
-    7. [Costume Mappings](#costume-mappings)
-    8. [Outfit Lab](#outfit-lab)
+    7. [Outfit Lab](#outfit-lab)
         1. [Prepare your character folders](#1-prepare-your-character-folders)
         2. [Enable the lab in settings](#2-enable-the-lab-in-settings)
         3. [Add characters and defaults](#3-add-characters-and-defaults)
@@ -34,14 +35,15 @@ Under the hood the extension listens to streaming output from your model, scores
         5. [Test and iterate safely](#5-test-and-iterate-safely)
         6. [Troubleshooting the Outfit Lab](#troubleshooting-the-outfit-lab)
         7. [Organizing multi-character cards](#organizing-multi-character-cards)
-    9. [Live Pattern Tester](#live-pattern-tester)
-    10. [Footer Controls](#footer-controls)
+    8. [Live Pattern Tester](#live-pattern-tester)
+    9. [Footer Controls](#footer-controls)
 8. [Understanding Live Tester Reports](#understanding-live-tester-reports)
-9. [Advanced Configuration Tips](#advanced-configuration-tips)
-10. [Slash Commands](#slash-commands)
-11. [Sharing Top Characters with Other Extensions](#sharing-top-characters-with-other-extensions)
-12. [Troubleshooting Checklist](#troubleshooting-checklist)
-13. [Support & Contributions](#support--contributions)
+9. [Action Beats Inside Dialogue](#action-beats-inside-dialogue)
+10. [Advanced Configuration Tips](#advanced-configuration-tips)
+11. [Slash Commands](#slash-commands)
+12. [Sharing Top Characters with Other Extensions](#sharing-top-characters-with-other-extensions)
+13. [Troubleshooting Checklist](#troubleshooting-checklist)
+14. [Support & Contributions](#support--contributions)
 
 ---
 
@@ -71,7 +73,7 @@ Under the hood the extension listens to streaming output from your model, scores
 1. Open **Settings → Extensions → Extension Manager** in SillyTavern.
 2. Click **Install from URL** and paste the repository address:
    ```
-   https://github.com/Archkr/SillyTavern-CostumeSwitch
+   https://github.com/archkrrr/SillyTavern-CostumeSwitch
    ```
 3. Press **Install**. SillyTavern downloads the extension and refreshes the page.
 4. Enable **Costume Switcher** from the Extensions list if it is not activated automatically.
@@ -97,12 +99,15 @@ Because each stage is isolated, you can tweak detector settings without relearni
 
 ## Custom Detection Engines
 
-Costume Switcher does not rely on third-party libraries for detection. Every matcher, bias rule, and cooldown is part of a fully custom detection stack purpose-built for SillyTavern roleplay. Both engines below share a common orchestration layer, yet each is tuned for a different job so you can mix expressive character work with razor-sharp costume swaps.
+Costume Switcher does not rely on third-party libraries for detection. Every matcher, bias rule, and cooldown is part of a fully custom detection stack purpose-built for SillyTavern roleplay. Both engines now share the refreshed preprocessing pipeline highlighted in the [Architecture Overview](#architecture-overview): the Step 1 stream listener, Step 2 profile compiler, and Step 3 detection pass normalize tokens, respect live translation toggles, and push the cleaned buffer into the scorers so each syllable stays explainable.
 
-### Main Detection Engine (v3)
+### Main Detection Engine (v4)
 
-Version 3 of the primary detection engine powers all speaker attribution. It represents the third full rewrite of the pipeline and focuses on clarity for end users:
+Version 4 powers every speaker attribution call. It layers the new preprocessing, token-awareness, and fuzzy/translation reconciliation directly into the first three steps of the architecture so you can mix expressive character work with razor-sharp costume swaps:
 
+- **Token-aware preprocessing** – The Step 1 stream listener cleans every token, strips zero-width and punctuation noise, and runs fuzzy/translation reconciliation before the detectors fire so v4 sees the same normalized text the Live Pattern Tester shows.
+- **Profile compiler upgrades** – Step 2 now bundles detector verb lists with the new preprocessing rules, meaning v4 can pair translation toggles, normalization modes, and regex prep scripts per profile without slowing the stream.
+- **Detection pass refresh** – Step 3 replays the normalized tokens through attribution, action, vocative, pronoun, and general-name detectors so the v4 engine can reason about both the raw buffer and the cleaned version at the same time.
 - **Detectors you can toggle** – Speaker tags, attribution verbs, action verbs, vocatives, possessives, pronouns, and general-name sweeps are all first-party detectors. Turn them on and off from the settings panel to mirror the way your story is written.
 - **Smart pronoun linking** – The engine remembers the last confirmed subject so that pronoun hits can keep the same character in focus, even when a paragraph swaps from “Alice” to “she.”
 - **Scene roster awareness** – Characters who were recently detected stay in a per-message roster with a configurable TTL. When the next decision comes up, roster members receive bonus weight so ensemble scenes stay stable.
@@ -110,11 +115,11 @@ Version 3 of the primary detection engine powers all speaker attribution. It rep
 - **Cooldown & veto safety nets** – A single decision gate enforces the global cooldown, per-trigger cooldowns, repeat suppression, and veto phrases. Switches are skipped gracefully when a rule applies, and the skip reason is logged for review.
 - **Explainer-first telemetry** – Matches, scores, roster membership, and skip reasons are stored alongside the final decision. Slash commands such as `/cs-stats` and `/cs-top` surface this telemetry directly in chat.
 
-The v3 engine is deterministic by design: given the same buffer and settings it will make the same call every time. That makes testing simple and gives you confidence that profile tweaks translate directly to the behaviour you expect.
+The v4 engine stays deterministic: given the same buffer and settings it will make the same call every time, only now it benefits from the token-aware preprocessing and fuzzy/translation hand-off introduced in the release notes.
 
-### Outfit Detection Engine (v1)
+### Outfit Detection Engine (v2)
 
-The outfit resolver is treated as its own detection engine because it layers additional rules on top of the main decision:
+The outfit resolver is treated as its own detection engine because it layers additional rules on top of the main decision while sharing the same preprocessing, fuzzy matching, and translation toggles described in steps 1–3 of the [Architecture Overview](#architecture-overview):
 
 - **Mapping-first resolution** – Character names (and aliases) map to base costume folders. Each mapping can include one or more outfit variants with custom labels.
 - **Trigger-driven variants** – Variants declare literal phrases or regex triggers. When a detection lands, the resolver evaluates those triggers against the full message buffer so outfits can react to mood, locations, or key phrases.
@@ -123,7 +128,7 @@ The outfit resolver is treated as its own detection engine because it layers add
 - **Cooldown-friendly caching** – Once a character ends up in a specific outfit, that choice is cached. Repeated detections of the same outfit are skipped until something actually changes, preventing needless `/costume` spam.
 - **Readable decisions** – The Live Pattern Tester and status banner show why a variant was selected (trigger hit, awareness rule, fallback, etc.), so you can iterate on rules without guessing.
 
-Outfit Detection Engine v1 is already powerful enough for mood-based wardrobe changes, yet it stays predictable by reusing the same telemetry and cooldown gates as the main engine.
+Outfit Detection Engine v2 stays predictable by reusing the same telemetry and cooldown gates as the main engine while now benefiting from the normalized text, fuzzy lookups, and translation-aware preprocessing shared with v4.
 
 ---
 
@@ -155,7 +160,7 @@ Create tailored setups for different stories or formats:
 
 ### Character Patterns & Filters
 Teach the detector which names to recognise:
-- **Active Characters** accepts plain names or `/regex/` entries—one per line.
+- **Active Characters** provides per-character slots with a primary name, optional alternate patterns (including `/regex/`), and an optional folder override for that character.
 - **Ignored Characters** suppresses specific matches without removing them from the character list.
 - **Veto Phrases** stops detection entirely for a message when the phrase or regex is found (useful for OOC tags).
 
@@ -164,6 +169,43 @@ Kickstart new profiles with curated presets, configure a **Default Costume** to 
 
 ### Detection Strategy
 Toggle the individual detectors the engine can use. Tooltips in the UI explain the common scenarios for each detection type. Enable **Scene Roster** to maintain a rolling list of characters active in the conversation and adjust the **Scene Roster TTL (messages)** to control how long they stay on that list.
+
+#### Regex Preprocessor quick guide
+Live chats rarely look like tidy handbook samples. The regex preprocessor is the “tidy up the transcript before anyone reads it” layer that runs before detections and outfit logic make a decision. Think of it as a programmable dishwasher: every message is run through a stack of regex scripts that scrub away the junk *before* the detectors even try to score a character.
+
+**How it works in practice**
+
+1. As soon as the model streams a token, Costume Switcher appends it to the buffer.
+2. The buffer is cloned and passed through the regex scripts you have enabled.
+3. Only the cleaned copy is handed to the detection and outfit engines, so none of the mess leaks into scoring.
+
+That cleaned copy can be shaped by three script collections without editing JSON:
+
+- **Global scripts** – Safe punctuation, spacing, and honorific cleanup for every profile. Use this whenever you pull text from AI models that like curly quotes, narrators that attach honorifics ("Alice-san"), or logs copied from streams with odd spacing.
+- **Preset scripts** – Curated bundles for community roleplay formats or popular stream layouts. Turn this on when your group shares a common markup style (bracketed actions, emoji markers, etc.) so everyone benefits from the same cleanup rules.
+- **Scoped scripts** – Per-character or per-profile helpers that only activate when their owner is in play. These are perfect for bilingual sheets that need kana → romaji guards, sci-fi logs that swap call signs, or any bespoke filter that should not affect the rest of your roster.
+
+For example, a preset script can convert `[Alice - whispers]` into `Alice whispers` so the attribution detector still fires, while a scoped script for `Yūri` can replace accented letters with plain ASCII only when she is on stage. Because the preprocessor runs inside the six-stage pipeline, the cleaned text feeds directly into live `/costume` calls, and the Live Pattern Tester shows the already-scrubbed version so you can confirm your scripts behave as expected.
+
+#### Fuzzy name matching quick guide
+Fuzzy matching is the “don’t panic when the spelling drifts” safety net. After the regex preprocessor finishes, both detection engines share the same normalization buffer. When a detector thinks it found a character but the score is too low (or the text contains heavy diacritics), the fuzzy module compares the detected text against your character list using edit distance. If the distance is within the active tolerance, the detector is upgraded to the closest character, the score is boosted, and the `/costume` call proceeds as if the spelling was perfect.
+
+Choose a preset from **Name Matching → Fuzzy Tolerance** based on how messy your chat usually is:
+
+- **Off** – Use when you are debugging or when the cast names are short, unique, and always typed correctly.
+- **Auto / Low Confidence** – Best everyday mode. The engine only attempts fuzzy rescue when a detector posts a weak score or when it spots accent-heavy text, keeping confident matches strict.
+- **Accent-only** – Ideal for bilingual chats that simply need Á→A or ゆり→Yuri remapping without touching other typos.
+- **Always** – Fast-paced chats with constant misspellings benefit from always-on fuzzy rescue so “Ailce” still maps to Alice mid-stream.
+- **Custom threshold** – Set your own low-confidence score ceiling when you know exactly how aggressive the fallback should be.
+
+To see the difference, paste `"Ailce reached for her staff."` into the Live Pattern Tester. With fuzzy matching off the action detector ignores the typo. Enable **Auto** and the detector rewrites the hit to **Alice** because the edit distance is only one letter, and the score now clears the decision gate. Pair the tolerance with the **Translate Accents** toggle whenever a scene swaps alphabets or diacritics frequently—the shared buffer ensures the extension rescues live detections immediately, while the tester mirrors every fuzzy rescue so you can preview the outcome.
+
+Fine-tune how those rescues behave with the advanced controls under **Name Matching**:
+
+- **Max fuzzy fallback score** – (Optional) Caps Fuse rescue scores between `0` and `1`. Set it around `0.4–0.6` to stop distant capitalized words from remapping to characters when the preset tolerance is already permissive; leave it blank to rely on the preset alone.
+- **Fallback cooldown (characters)** – (Optional) Requires a minimum character gap before the same name can be rescued again. Keep the default 200-character window to dampen repeated spam, or lower it for tight call-and-response transcripts where back-to-back mentions should still resolve.
+
+Need to scan lowercase cues or system prompts (for example, when a preset intentionally lowercases speaker labels)? Flip on **Scan Lowercase Cues** under Name Matching. It re-enables the lowercase sweep for fuzzy fallback rescues so those intentionally lowercased cues can still remap to your cast. Leave it off for normal chats so filler words like “and/but” stay ignored.
 
 ### Performance & Bias
 Fine-tune responsiveness and tie-breaking behaviour:
@@ -175,11 +217,8 @@ Fine-tune responsiveness and tie-breaking behaviour:
 - **Token Process Threshold (chars)** – Number of characters that must arrive before the buffer is rescored.
 - **Detection Bias** – Slider balancing match priority versus recency; positive numbers favour dialogue/action tags, negative values favour the latest mention.
 
-### Costume Mappings
-Map any detected name or alias to a specific costume folder. Use **Add Mapping** to append rows, then fill in the character and destination folder names.
-
 ### Outfit Lab
-The Outfit Lab is an experimental workspace for staging wardrobe variants without destabilising your live mappings. Variants saved here run in the detection engine as soon as **Enable Experimental Outfits** is toggled on for the active profile.
+The Outfit Lab is the home for outfit-aware automation. Variants saved here run in the detection engine as soon as you save them for the active profile.
 
 #### 1. Prepare your character folders
 Keep your prototypes in an `Outfit Lab` subdirectory under the character’s main folder. Each outfit variant receives its own subfolder, and every variant should reuse the same expression filenames as the parent directory so expression lookups remain valid.
@@ -205,8 +244,8 @@ SillyTavern/data/default-user/characters/Mythic Frontier/
 - Each variant inherits the base outfit’s expression manifest. Missing files fall back to whatever PNGs exist in the variant directory; anything absent simply cannot render. Drop at least a `portrait.png` in every folder so fallbacks always have artwork.
 - Store shared assets (e.g., accessories or props) alongside the variant art if you reference them directly. SillyTavern only serves files that live inside the selected outfit directory.
 
-#### 2. Enable the lab in settings
-Open **Settings → Extensions → Costume Switcher → Outfits (Preview)**. The editor stays read-only until you flip **Enable Experimental Outfits** on. Once enabled you can add, edit, or remove variants; turning it back off preserves the data but keeps the profile on its default folders.
+#### 2. Open the lab in settings
+Open **Settings → Extensions → Costume Switcher → Outfits**. The editor auto-saves changes after each interaction, and automation stays active for every character you configure.
 
 #### 3. Add characters and defaults
 Use **Add Character Slot** to create a card per character you want to experiment with. Fill in:
@@ -214,29 +253,29 @@ Use **Add Character Slot** to create a card per character you want to experiment
 - **Character Name** – the detected name or alias that should trigger the outfit.
 - **Default Folder** – the production-ready costume directory. Variants fall back here when no triggers match.
 
-These values sync with the main **Costume Mappings** table, so characters you configure in the lab are also available to the standard mapping workflow.
+These values feed directly into the live detector, so characters you configure in the lab participate in automation without an extra mapping table.
 
 #### 4. Build outfit variations
-Inside each card, click **Add Outfit Variation** to define experimental looks:
+Inside each card, click **Add Outfit Variation** to define automated looks:
 
 - **Label (optional)** – Friendly display name for the Live Tester and debug logs.
 - **Folder** – Path to the prototype outfit. Use the directory picker or paste the relative path shown in your SillyTavern character tree.
 - **Triggers** – One literal or `/regex/` pattern per line. Variants with no triggers act as always-on fallbacks after earlier variants fail.
 - **Match Types** – Limit the variant to specific detection sources. Options include `Speaker`, `Attribution`, `Action`, `Pronoun`, `Vocative`, `Possessive`, and `General Name`. Leave all unchecked to accept every match.
 - **Scene Awareness** – Require or exclude characters from the active scene roster. Fill in **Requires all of…**, **Requires any of…**, or **Exclude when present** (one name per line). The roster is case-insensitive and only populated when the **Scene Roster** detector is enabled in **Detection Strategy**.
+- **Priority** – Higher numbers take precedence when more than one variant qualifies. Ties resolve in favour of variants that matched triggers, then variants with more awareness rules, then variants limited to specific match types, and finally by creation order.
 
-Variants evaluate in order from top to bottom. The first entry whose folder exists, whose match type (if any) aligns with the detection event, whose triggers match the streaming text, and whose scene-awareness rules pass becomes the active outfit. Everything else falls back to the card’s default folder.
+Variants evaluate using priority before folder order. The engine selects the highest-priority variant that matches, breaking ties using trigger matches, awareness specificity, match-type filters, and finally the order the variants were created. If nothing qualifies the character falls back to the card’s default folder.
 
 #### 5. Test and iterate safely
-- Use the **Live Pattern Tester** with the lab enabled to verify which variant would win given sample prose. Trigger matches and awareness reasons appear in the report.
-- When a variant is ready for production, disable the lab, move the folder out of `Outfit Lab`, and update the default mapping, or leave the lab on to keep routing live traffic through the variants.
+- Use the **Live Pattern Tester** to verify which variant would win given sample prose. Trigger matches and awareness reasons appear in the report.
+- When a variant is ready for production, move the folder out of `Outfit Lab` and update the default mapping, or leave the lab entry in place to keep routing live traffic through the variants.
 - Profiles store their lab configuration alongside mappings. Exporting a profile JSON carries the variants with it for backups or sharing.
 
 #### Troubleshooting the Outfit Lab
-- **Variant never fires** – Confirm the variant folder path is relative to your `characters/` directory and spelled exactly like the filesystem entry. Remember variants run sequentially; drag the card handles to reorder if a broader variant is catching the trigger first.
+- **Variant never fires** – Confirm the variant folder path is relative to your `characters/` directory and spelled exactly like the filesystem entry. Use the new **Priority** field to make the desired variant win when multiple entries match the same context.
 - **Scene rules never pass** – Enable **Scene Roster** under **Detection Strategy** and keep the TTL high enough for characters to remain “active.” Names are normalised to lowercase; match the roster spelling (e.g., `captain ardan`).
 - **Missing expressions** – Copy the full expression set into each variant directory. Because the manifest is shared, only files that physically exist in the selected folder can render.
-- **Editor looks disabled** – The lab requires **Enable Experimental Outfits** to be on. When off, the UI intentionally locks to prevent accidental edits during live sessions.
 - **Profile reset lost variants** – Variants live inside the active profile. Save the profile after edits and export periodic backups via the Profiles card.
 
 #### Organizing multi-character cards
@@ -306,6 +345,31 @@ Attach these reports when filing bug reports or asking for tuning advice—every
 
 ---
 
+## Action Beats Inside Dialogue
+Dialogue in long-form roleplay often includes *action beats*—short descriptions or tone cues tucked inside the same sentence as spoken words. Costume Switcher recognises these patterns so that switches stay accurate even when a character’s name is embedded between quotation marks.
+
+### Why the detector cares
+- Action beats often reintroduce a speaker without repeating a dialogue tag ("Alex said").
+- The inserted narration carries the character’s name, so recognising it lets the engine keep that character in focus without waiting for a fresh attribution verb.
+- Scenes with multiple speakers lean on these beats to show reactions ("She laughed, \"I told you so.\""). Without action detection, the costume might flicker to the wrong person.
+
+### How to make the most of it
+1. Enable **Detect Action** in **Detection Strategy**. This tells the engine to look for verbs and names inside the dialogue line itself.
+2. Keep your **Action Verbs** list stocked with the moves your characters perform while talking (e.g., "shrugged," "grinned," "adjusted"). Custom verbs help the detector catch more nuanced beats.
+3. Review the **Detection log** column in Live Tester reports. Matches with the `action` kind confirm that the beat contributed to the decision.
+
+### Example snippets the engine understands
+- "Listen," **Morgan whispered**, adjusting the lantern, "we can’t wait until dawn."  
+  The detector spots the verb "whispered" plus Morgan’s name between the two halves of the quote and keeps Morgan’s costume active.
+- "Hands off," **Captain Reyes said**, tightening their grip on the throttle, "or the hangar doors stay shut."  
+  The inserted clause reinforces that Reyes is still speaking even though the sentence stretches across multiple beats.
+- "If you’re staying," **Taylor added**, "grab a coat—" **they shivered** just looking at the frost.  
+  Both the mid-sentence tag and the trailing beat include Taylor’s name, giving the engine multiple action matches to confirm the speaker.
+
+Use these structures when testing profiles: if the Live Tester shows consistent `action` matches for beats like these, your dialogue-heavy stories will switch costumes without missing a step.
+
+---
+
 ## Advanced Configuration Tips
 - **Tune the buffer** when working with long-form prose. Reduce **Max Buffer Size** to keep focus on the latest paragraphs or increase it to catch callbacks to earlier exposition.
 - **Combine cooldowns** to eliminate flicker. A short global cooldown paired with per-trigger cooldowns stops rapid-fire switches without muting genuinely new speakers.
@@ -343,7 +407,7 @@ Because these exports are refreshed on every message, you can wire them directly
 ## Troubleshooting Checklist
 1. **No switches happen:** verify streaming is enabled, the master toggle is on, at least one detection method is selected, and the characters appear in the patterns list exactly as they do in the story.
 2. **The wrong character is chosen:** run the Live Pattern Tester, read the skip reasons, and adjust Detection Bias or enable Scene Roster to give dialogue tags more weight.
-3. **Switches flicker between characters:** raise the global cooldown, tweak per-trigger cooldowns, or disable **Detect General Mentions** for subtle references.
+3. **Switches flicker between characters:** raise the global cooldown, tweak per-trigger cooldowns, or disable **Detect General Name Mentions** for subtle references.
 4. **Reports show a veto:** check the Veto Phrases list to confirm the text did not match an OOC filter.
 5. **Profiles do not persist:** ensure you click **Save** after editing and confirm the SillyTavern browser tab has permission to write local storage.
 
