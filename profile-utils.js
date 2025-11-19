@@ -87,6 +87,41 @@ function cloneStringList(source) {
     return result;
 }
 
+const SCRIPT_COLLECTION_ORDER = ["global", "preset", "scoped"];
+
+export function normalizeScriptCollections(raw, defaults = []) {
+    const selections = new Set();
+    const applyValue = (value) => {
+        if (typeof value !== "string") {
+            return;
+        }
+        const normalized = value.trim().toLowerCase();
+        if (SCRIPT_COLLECTION_ORDER.includes(normalized)) {
+            selections.add(normalized);
+        }
+    };
+
+    if (Array.isArray(defaults)) {
+        defaults.forEach(applyValue);
+    } else if (typeof defaults === "string") {
+        applyValue(defaults);
+    }
+
+    if (Array.isArray(raw)) {
+        raw.forEach(applyValue);
+    } else if (raw && typeof raw === "object") {
+        Object.entries(raw).forEach(([key, value]) => {
+            if (value) {
+                applyValue(key);
+            }
+        });
+    } else {
+        applyValue(raw);
+    }
+
+    return SCRIPT_COLLECTION_ORDER.filter(key => selections.has(key));
+}
+
 export function normalizePatternSlot(entry = {}) {
     const source = entry && typeof entry === 'object' ? entry : {};
     const cloned = safeClone(source) || {};
@@ -161,6 +196,81 @@ export function patternSlotHasIdentity(entry = {}, { normalized = false } = {}) 
     const aliases = Array.isArray(source.aliases) ? source.aliases.map((alias) => String(alias ?? '').trim()).filter(Boolean) : [];
 
     return Boolean(name || folder || aliases.length);
+}
+
+function cloneSlotValue(value) {
+    if (Array.isArray(value)) {
+        return value.map((item) => cloneSlotValue(item));
+    }
+    if (value && typeof value === 'object') {
+        return { ...value };
+    }
+    return value;
+}
+
+function syncPatternSlotReference(target, source) {
+    if (!target || typeof target !== 'object') {
+        return source;
+    }
+    if (!source || typeof source !== 'object') {
+        return target;
+    }
+
+    const reservedKeys = new Set(['__slotId']);
+    const sourceKeys = Object.keys(source);
+
+    for (const key of Object.keys(target)) {
+        if (reservedKeys.has(key)) {
+            continue;
+        }
+        if (!sourceKeys.includes(key)) {
+            delete target[key];
+        }
+    }
+
+    for (const key of sourceKeys) {
+        if (reservedKeys.has(key)) {
+            continue;
+        }
+        const value = source[key];
+        if (value === undefined) {
+            delete target[key];
+            continue;
+        }
+        target[key] = cloneSlotValue(value);
+    }
+
+    return target;
+}
+
+export function reconcilePatternSlotReferences(existingSlots = [], nextSlots = []) {
+    if (!Array.isArray(nextSlots)) {
+        return [];
+    }
+
+    const lookup = new Map();
+    if (Array.isArray(existingSlots)) {
+        existingSlots.forEach((slot) => {
+            if (!slot || typeof slot !== 'object') {
+                return;
+            }
+            const slotId = typeof slot.__slotId === 'string' ? slot.__slotId : null;
+            if (slotId) {
+                lookup.set(slotId, slot);
+            }
+        });
+    }
+
+    return nextSlots.map((slot) => {
+        if (!slot || typeof slot !== 'object') {
+            return slot;
+        }
+        const slotId = typeof slot.__slotId === 'string' ? slot.__slotId : null;
+        if (slotId && lookup.has(slotId)) {
+            return syncPatternSlotReference(lookup.get(slotId), slot);
+        }
+        return slot;
+    });
 }
 
 export function flattenPatternSlots(slots = []) {
@@ -292,6 +402,11 @@ export function normalizeProfile(profile = {}, defaults = {}) {
     const base = defaults && typeof defaults === 'object' ? (safeClone(defaults) || {}) : {};
     const source = profile && typeof profile === 'object' ? (safeClone(profile) || {}) : {};
     const merged = Object.assign(base, source);
+
+    const defaultScriptCollections = Array.isArray(defaults?.scriptCollections)
+        ? defaults.scriptCollections
+        : [];
+    merged.scriptCollections = normalizeScriptCollections(source.scriptCollections, defaultScriptCollections);
 
     const originalPatternSlots = Array.isArray(profile?.patternSlots) ? profile.patternSlots : [];
 
